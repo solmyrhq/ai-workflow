@@ -4,7 +4,13 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Integrations;
 
-use AiWorkflow\PrismExceptionInspector;
+use AiWorkflow\Exceptions\HttpErrorDetails;
+use AiWorkflow\Exceptions\ProviderConnectionException;
+use AiWorkflow\Exceptions\ProviderOverloadedException;
+use AiWorkflow\Exceptions\RateLimitedException;
+use AiWorkflow\Exceptions\StructuredDecodingException;
+use AiWorkflow\Exceptions\UnexpectedFinishReasonException;
+use AiWorkflow\Exceptions\UpstreamErrorException;
 use Illuminate\Http\Client\ConnectionException;
 use Integrations\Contracts\ClassifiesFailures;
 use Integrations\Contracts\CustomizesRetry;
@@ -12,11 +18,6 @@ use Integrations\Contracts\DeclaresRateLimit;
 use Integrations\Contracts\IntegrationProvider;
 use Integrations\Enums\FailureClass;
 use Integrations\RateLimit;
-use Prism\Prism\Exceptions\PrismException;
-use Prism\Prism\Exceptions\PrismProviderOverloadedException;
-use Prism\Prism\Exceptions\PrismRateLimitedException;
-use Prism\Prism\Exceptions\PrismRequestTooLargeException;
-use Prism\Prism\Exceptions\PrismStructuredDecodingException;
 use Throwable;
 
 /**
@@ -32,25 +33,29 @@ class OpenRouterProvider implements ClassifiesFailures, CustomizesRetry, Declare
     public function classifyFailure(Throwable $e): ?FailureClass
     {
         for ($current = $e; $current !== null; $current = $current->getPrevious()) {
-            // Provider rate limit — OpenRouter is healthy and just pacing us.
-            if ($current instanceof PrismRateLimitedException) {
+            if ($current instanceof RateLimitedException) {
                 return FailureClass::Throttle;
             }
 
-            // Provider overloaded — a transient upstream fault worth retrying.
-            if ($current instanceof PrismProviderOverloadedException) {
+            if ($current instanceof ProviderOverloadedException
+                || $current instanceof ProviderConnectionException
+                || $current instanceof UnexpectedFinishReasonException) {
                 return FailureClass::Upstream;
             }
 
             // A malformed structured response isn't a transport fault; AiService
             // recovers via its own fallback-model path. Defer so the breaker
             // neither trips nor retries it.
-            if ($current instanceof PrismStructuredDecodingException) {
+            if ($current instanceof StructuredDecodingException) {
                 return null;
             }
 
-            if ($current instanceof PrismRequestTooLargeException) {
-                return FailureClass::Client;
+            // For an error envelope on an HTTP 200, or a stream error,
+            // OpenRouter puts the real HTTP status in the error code.
+            if ($current instanceof UpstreamErrorException) {
+                $class = $current->errorCode !== null ? FailureClass::fromStatus($current->errorCode) : FailureClass::Upstream;
+
+                return $class === FailureClass::Unknown ? FailureClass::Upstream : $class;
             }
 
             if ($current instanceof ConnectionException) {
@@ -58,20 +63,9 @@ class OpenRouterProvider implements ClassifiesFailures, CustomizesRetry, Declare
             }
         }
 
-        // 5xx → Upstream, 429 → Throttle, 402/403/other 4xx → Client. Prism
-        // stashes the status on the exception as a property the core
-        // classifier's duck-typing can't read, so we read it explicitly.
-        $status = PrismExceptionInspector::httpStatus($e);
+        $status = HttpErrorDetails::status($e);
         if ($status !== null) {
             return FailureClass::fromStatus($status);
-        }
-
-        // A status-less Prism failure (e.g. a 5xx surfaced as a 200 + error
-        // body) is a transient upstream fault, not a client mistake.
-        for ($current = $e; $current !== null; $current = $current->getPrevious()) {
-            if ($current instanceof PrismException) {
-                return FailureClass::Upstream;
-            }
         }
 
         return null;
@@ -90,7 +84,7 @@ class OpenRouterProvider implements ClassifiesFailures, CustomizesRetry, Declare
     public function retryDelayMs(Throwable $e, int $attempt, ?int $statusCode): ?int
     {
         $config = $this->retryConfig();
-        $status = $statusCode ?? PrismExceptionInspector::httpStatus($e);
+        $status = $statusCode ?? HttpErrorDetails::status($e);
 
         $delay = $this->baseDelayMs($e, $attempt, $status, $config);
         if ($delay === null) {
@@ -151,22 +145,28 @@ class OpenRouterProvider implements ClassifiesFailures, CustomizesRetry, Declare
     }
 
     /**
-     * The base retry delay (pre-jitter) for an exception, mirroring the backoff
-     * ai-workflow applied through Prism's client retry: a fixed pause on rate
-     * limits, linear growth on 5xx, and deferral (null) for everything else.
+     * The base retry delay (pre-jitter) for an exception: a fixed pause on rate
+     * limits, linear growth on upstream faults, and deferral (null) for
+     * everything else.
      *
      * @param  array{rate_limit_delay_ms: int, server_error_multiplier_ms: int, jitter: bool}  $config
      */
     private function baseDelayMs(Throwable $e, int $attempt, ?int $status, array $config): ?int
     {
         for ($current = $e; $current !== null; $current = $current->getPrevious()) {
-            if ($current instanceof PrismRateLimitedException) {
+            if ($current instanceof RateLimitedException) {
                 return $current->retryAfter !== null
                     ? $current->retryAfter * 1000
                     : $config['rate_limit_delay_ms'];
             }
 
-            if ($current instanceof PrismProviderOverloadedException) {
+            if ($current instanceof UpstreamErrorException && $current->errorCode === 429) {
+                return $config['rate_limit_delay_ms'];
+            }
+
+            if ($current instanceof ProviderOverloadedException
+                || $current instanceof UnexpectedFinishReasonException
+                || $current instanceof UpstreamErrorException) {
                 return $attempt * $config['server_error_multiplier_ms'];
             }
         }

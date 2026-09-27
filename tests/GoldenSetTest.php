@@ -8,12 +8,9 @@ use AiWorkflow\Eval\GoldenSetAssembler;
 use AiWorkflow\Models\AiWorkflowAnnotation;
 use AiWorkflow\Models\AiWorkflowEvalScore;
 use AiWorkflow\Models\AiWorkflowRequest;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Fixtures\RecordsGroundTruthJudge;
 use InvalidArgumentException;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\ValueObjects\Usage;
 
 class GoldenSetTest extends DatabaseTestCase
 {
@@ -158,12 +155,7 @@ class GoldenSetTest extends DatabaseTestCase
 
     public function test_eval_run_from_annotations_scores_against_the_human_label(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['close_ticket' => ['likelihood' => 90]])
-                ->withUsage(new Usage(11, 22, thoughtTokens: 7))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['close_ticket' => ['likelihood' => 90]], OpenRouterFake::tokens(11, 22, reasoning: 7)));
 
         $request = $this->makeRequest(promptId: 'decide_next_action');
         AiWorkflowAnnotation::create([
@@ -201,12 +193,7 @@ class GoldenSetTest extends DatabaseTestCase
 
     public function test_eval_run_can_narrow_to_corrections(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['close_ticket' => ['likelihood' => 90]])
-                ->withUsage(new Usage(1, 1))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['close_ticket' => ['likelihood' => 90]], OpenRouterFake::tokens(1, 1)));
 
         $agreed = $this->makeRequest(promptId: 'decide_next_action');
         AiWorkflowAnnotation::create(['request_id' => $agreed->id, 'label' => 'respond_to_customer']);

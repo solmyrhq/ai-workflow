@@ -1,0 +1,14 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1758200100-Qm3Lk8WzRt5Yp2Nv7Hc0","provider":"Google","model":"google/gemini-3-pro","object":"chat.completion.chunk","created":1758200100,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Checking the forecast","reasoning_details":[{"type":"reasoning.text","text":"Checking the forecast","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1758200100-Qm3Lk8WzRt5Yp2Nv7Hc0","provider":"Google","model":"google/gemini-3-pro","object":"chat.completion.chunk","created":1758200100,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":" for Lisbon.","reasoning_details":[{"type":"reasoning.text","text":" for Lisbon.","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1758200100-Qm3Lk8WzRt5Yp2Nv7Hc0","provider":"Google","model":"google/gemini-3-pro","object":"chat.completion.chunk","created":1758200100,"choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"tool_get_weather_Zp4qR7","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Lisbon\"}"}}],"reasoning_details":[{"type":"reasoning.encrypted","data":"CiQB0e2Kb7vX9mQ3pL1sR8tWc4YhN6uJ2kD5fG0aE","format":"google-gemini-v1","index":1}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1758200100-Qm3Lk8WzRt5Yp2Nv7Hc0","provider":"Google","model":"google/gemini-3-pro","object":"chat.completion.chunk","created":1758200100,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"tool_calls","native_finish_reason":"STOP","logprobs":null}]}
+
+data: {"id":"gen-1758200100-Qm3Lk8WzRt5Yp2Nv7Hc0","provider":"Google","model":"google/gemini-3-pro","object":"chat.completion.chunk","created":1758200100,"choices":[],"usage":{"prompt_tokens":301,"completion_tokens":42,"total_tokens":343,"cost":0.000791,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":18}}}
+
+data: [DONE]
+

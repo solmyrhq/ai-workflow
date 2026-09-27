@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Tests;
 
+use AiWorkflow\Enums\FinishReason;
 use AiWorkflow\Events\AiWorkflowRequestCompleted;
 use AiWorkflow\Events\AiWorkflowRequestFailed;
 use AiWorkflow\Listeners\SentryBreadcrumbListener;
@@ -12,8 +13,7 @@ use AiWorkflow\Models\AiWorkflowRequest;
 use AiWorkflow\Models\Builders\AiWorkflowExecutionBuilder;
 use AiWorkflow\Models\Builders\AiWorkflowRequestBuilder;
 use AiWorkflow\PromptData;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\ValueObjects\Usage;
+use AiWorkflow\Responses\Usage;
 
 class ObservabilityTest extends DatabaseTestCase
 {

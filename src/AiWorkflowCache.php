@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace AiWorkflow;
 
+use AiWorkflow\Messages\Message;
+use AiWorkflow\Schema\ResponseSchema;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Support\Facades\Cache;
-use Prism\Prism\Contracts\Message;
-use Prism\Prism\Schema\ObjectSchema;
 
 class AiWorkflowCache
 {
@@ -21,7 +21,7 @@ class AiWorkflowCache
         string $model,
         string $systemPrompt,
         array $messages,
-        ?ObjectSchema $schema = null,
+        ?ResponseSchema $schema = null,
     ): string {
         $payload = json_encode([
             'provider' => $provider,

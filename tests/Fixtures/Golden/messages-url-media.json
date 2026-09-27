@@ -1,0 +1,27 @@
+[
+    {
+        "type": "user",
+        "content": "Compare these",
+        "additional_content": [
+            {
+                "media_type": "image",
+                "url": "https://example.com/photo.jpg",
+                "base64": "PGh0bWw+",
+                "mime_type": "image/jpeg"
+            },
+            {
+                "media_type": "document",
+                "url": "https://example.com/report.pdf",
+                "base64": "PGh0bWw+",
+                "mime_type": "text/html",
+                "document_title": "Report"
+            },
+            {
+                "media_type": "video",
+                "url": "https://example.com/clip.mp4",
+                "base64": "PGh0bWw+",
+                "mime_type": "video/mp4"
+            }
+        ]
+    }
+]

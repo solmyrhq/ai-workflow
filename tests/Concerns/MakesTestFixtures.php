@@ -5,8 +5,7 @@ declare(strict_types=1);
 namespace AiWorkflow\Tests\Concerns;
 
 use AiWorkflow\PromptData;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Schema\StringSchema;
+use AiWorkflow\Schema\ResponseSchema;
 
 trait MakesTestFixtures
 {
@@ -25,15 +24,14 @@ trait MakesTestFixtures
         );
     }
 
-    private function makeSchema(): ObjectSchema
+    private function makeSchema(): ResponseSchema
     {
-        return new ObjectSchema(
-            name: 'test',
-            description: 'A test schema',
-            properties: [
-                new StringSchema('answer', 'The answer'),
-            ],
-            requiredFields: ['answer'],
-        );
+        return new ResponseSchema('test', [
+            'description' => 'A test schema',
+            'type' => 'object',
+            'properties' => ['answer' => ['description' => 'The answer', 'type' => 'string']],
+            'required' => ['answer'],
+            'additionalProperties' => false,
+        ]);
     }
 }

@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Exceptions;
 
-use Prism\Prism\ValueObjects\Usage;
+use AiWorkflow\Responses\Usage;
 use RuntimeException;
 
 class AiWorkflowException extends RuntimeException

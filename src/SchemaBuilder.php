@@ -6,14 +6,8 @@ namespace AiWorkflow;
 
 use AiWorkflow\Attributes\ArrayItemType;
 use AiWorkflow\Attributes\Description;
+use AiWorkflow\Schema\ResponseSchema;
 use BackedEnum;
-use Prism\Prism\Contracts\Schema;
-use Prism\Prism\Schema\ArraySchema;
-use Prism\Prism\Schema\BooleanSchema;
-use Prism\Prism\Schema\EnumSchema;
-use Prism\Prism\Schema\NumberSchema;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Schema\StringSchema;
 use ReflectionClass;
 use ReflectionIntersectionType;
 use ReflectionNamedType;
@@ -22,21 +16,34 @@ use ReflectionUnionType;
 use RuntimeException;
 use Spatie\LaravelData\Data;
 
+/**
+ * Generates a strict JSON Schema from a Spatie LaravelData class. The schema
+ * is part of the response cache key and is stored on logged requests, so its
+ * key order and layout must match 6.x, which UpgradeCompatibilityTest checks.
+ */
 class SchemaBuilder
 {
     /**
-     * Generate an ObjectSchema from a Spatie LaravelData class.
-     *
      * @param  class-string<Data>  $dataClass
      */
-    public static function fromDataClass(string $dataClass): ObjectSchema
+    public static function fromDataClass(string $dataClass): ResponseSchema
     {
         if (! class_exists(Data::class)) {
             throw new RuntimeException('spatie/laravel-data is required to use SchemaBuilder. Install it with: composer require spatie/laravel-data');
         }
 
-        $reflection = new ReflectionClass($dataClass);
-        $constructor = $reflection->getConstructor();
+        $name = (new ReflectionClass($dataClass))->getShortName();
+
+        return new ResponseSchema($name, self::objectSchema($dataClass, $name, false));
+    }
+
+    /**
+     * @param  class-string  $dataClass
+     * @return array<string, mixed>
+     */
+    private static function objectSchema(string $dataClass, string $description, bool $nullable): array
+    {
+        $constructor = (new ReflectionClass($dataClass))->getConstructor();
 
         if ($constructor === null) {
             throw new RuntimeException("Data class {$dataClass} has no constructor");
@@ -47,22 +54,22 @@ class SchemaBuilder
 
         foreach ($constructor->getParameters() as $param) {
             $name = $param->getName();
-            $type = $param->getType();
-            $description = self::getDescription($param);
-
-            [$schema] = self::resolveType($type, $name, $description, $param);
-            $properties[] = $schema;
+            $properties[$name] = self::resolveType($param->getType(), $name, self::getDescription($param), $param);
 
             // Strict mode rejects a schema that lists a key in `properties` but not in `required`.
             $requiredFields[] = $name;
         }
 
-        return new ObjectSchema(
-            name: $reflection->getShortName(),
-            description: $reflection->getShortName(),
-            properties: $properties,
-            requiredFields: $requiredFields,
-        );
+        $schema = ['description' => $description, 'type' => self::type('object', $nullable)];
+
+        if ($properties !== []) {
+            $schema['properties'] = $properties;
+        }
+
+        $schema['required'] = $requiredFields;
+        $schema['additionalProperties'] = false;
+
+        return $schema;
     }
 
     /**
@@ -175,9 +182,9 @@ class SchemaBuilder
     }
 
     /**
-     * @return array{Schema, bool} [schema, nullable]
+     * @return array<string, mixed>
      */
-    private static function resolveType(?\ReflectionType $type, string $name, string $description, ?ReflectionParameter $param = null): array
+    private static function resolveType(?\ReflectionType $type, string $name, string $description, ReflectionParameter $param): array
     {
         if ($type === null) {
             throw new RuntimeException("Property '{$name}' has no type declaration");
@@ -214,93 +221,76 @@ class SchemaBuilder
         $nullable = $nullable || $namedType->allowsNull();
 
         // Strict mode cannot leave a key out, so a defaulted property needs a null to return.
-        $nullable = $nullable || ($param !== null && $param->isDefaultValueAvailable());
+        $nullable = $nullable || $param->isDefaultValueAvailable();
 
-        $schema = self::mapNamedType($namedType->getName(), $name, $description, $nullable, $param);
-
-        return [$schema, $nullable];
-    }
-
-    private static function mapNamedType(string $typeName, string $name, string $description, bool $nullable, ?ReflectionParameter $param = null): Schema
-    {
-        return match ($typeName) {
-            'string' => new StringSchema($name, $description, $nullable),
-            'int', 'float' => new NumberSchema($name, $description, $nullable),
-            'bool' => new BooleanSchema($name, $description, $nullable),
-            'array' => new ArraySchema($name, $description, self::resolveArrayItemSchema($param), $nullable),
-            default => self::mapClassType($typeName, $name, $description, $nullable),
+        return match ($namedType->getName()) {
+            'string' => self::scalar('string', $description, $nullable),
+            'int', 'float' => self::scalar('number', $description, $nullable),
+            'bool' => self::scalar('boolean', $description, $nullable),
+            'array' => ['description' => $description, 'type' => self::type('array', $nullable), 'items' => self::arrayItemSchema($param)],
+            default => self::classSchema($namedType->getName(), $name, $description, $nullable),
         };
     }
 
-    private static function resolveArrayItemSchema(?ReflectionParameter $param): Schema
+    /**
+     * @return array<string, mixed>
+     */
+    private static function arrayItemSchema(ReflectionParameter $param): array
     {
-        if ($param === null) {
-            return new StringSchema('item', 'Array item');
-        }
-
         $attributes = $param->getAttributes(ArrayItemType::class);
 
         if ($attributes === []) {
-            return new StringSchema('item', 'Array item');
+            return self::scalar('string', 'Array item', false);
         }
 
-        /** @var ArrayItemType $itemType */
-        $itemType = $attributes[0]->newInstance();
-        $typeName = $itemType->type;
+        $typeName = $attributes[0]->newInstance()->type;
 
-        return match ($typeName) {
-            'string' => new StringSchema('item', 'Array item'),
-            'int', 'float' => new NumberSchema('item', 'Array item'),
-            'bool' => new BooleanSchema('item', 'Array item'),
-            default => self::resolveArrayItemClassType($typeName),
+        return match (true) {
+            $typeName === 'int', $typeName === 'float' => self::scalar('number', 'Array item', false),
+            $typeName === 'bool' => self::scalar('boolean', 'Array item', false),
+            is_subclass_of($typeName, Data::class) => self::objectSchema($typeName, 'Array item', false),
+            default => self::scalar('string', 'Array item', false),
         };
     }
 
-    private static function resolveArrayItemClassType(string $typeName): Schema
+    /**
+     * @return array<string, mixed>
+     */
+    private static function classSchema(string $typeName, string $name, string $description, bool $nullable): array
     {
-        if (class_exists($typeName) && is_subclass_of($typeName, Data::class)) {
-            $nested = self::fromDataClass($typeName);
-
-            return new ObjectSchema(
-                'item',
-                'Array item',
-                $nested->properties,
-                $nested->requiredFields,
-            );
-        }
-
-        return new StringSchema('item', 'Array item');
-    }
-
-    private static function mapClassType(string $typeName, string $name, string $description, bool $nullable): Schema
-    {
-        if (! class_exists($typeName) && ! enum_exists($typeName)) {
-            throw new RuntimeException("Property '{$name}' type '{$typeName}' cannot be mapped to a schema");
-        }
-
         if (is_subclass_of($typeName, Data::class)) {
-            $nested = self::fromDataClass($typeName);
-
-            return new ObjectSchema(
-                $name,
-                $description,
-                $nested->properties,
-                $nested->requiredFields,
-                nullable: $nullable,
-            );
+            return self::objectSchema($typeName, $description, $nullable);
         }
 
         if (is_subclass_of($typeName, BackedEnum::class)) {
-            /** @var list<string|int> $options */
-            $options = array_map(
-                fn (BackedEnum $case): string|int => $case->value,
-                $typeName::cases(),
-            );
+            $options = array_map(fn (BackedEnum $case): string|int => $case->value, $typeName::cases());
 
-            return new EnumSchema($name, $description, $options, $nullable);
+            $types = array_values(array_unique(array_map(fn (string|int $option): string => is_int($option) ? 'number' : 'string', $options)));
+
+            if ($nullable) {
+                $types[] = 'null';
+            }
+
+            return ['description' => $description, 'enum' => $options, 'type' => count($types) === 1 ? $types[0] : $types];
         }
 
         throw new RuntimeException("Property '{$name}' type '{$typeName}' cannot be mapped to a schema");
+    }
+
+    /**
+     * @return array{description: string, type: string|list<string>}
+     */
+    private static function scalar(string $type, string $description, bool $nullable): array
+    {
+        return ['description' => $description, 'type' => self::type($type, $nullable)];
+    }
+
+    /**
+     * @return string|list<string>
+     */
+    private static function type(string $type, bool $nullable): string|array
+    {
+        return $nullable ? [$type, 'null'] : $type;
     }
 
     private static function getDescription(ReflectionParameter $param): string

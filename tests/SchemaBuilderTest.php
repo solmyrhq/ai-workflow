@@ -5,17 +5,24 @@ declare(strict_types=1);
 namespace AiWorkflow\Tests;
 
 use AiWorkflow\AiService;
+use AiWorkflow\Enums\FinishReason;
 use AiWorkflow\Enums\GuardrailDirection;
 use AiWorkflow\Exceptions\GuardrailViolationException;
+use AiWorkflow\Exceptions\ProviderRequestException;
+use AiWorkflow\Exceptions\RateLimitedException;
 use AiWorkflow\Exceptions\StructuredDataRequestException;
 use AiWorkflow\Exceptions\StructuredValidationException;
+use AiWorkflow\Exceptions\UnexpectedFinishReasonException;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Middleware\AiWorkflowContext;
 use AiWorkflow\Middleware\AiWorkflowMiddleware;
 use AiWorkflow\Middleware\InputGuardrail;
 use AiWorkflow\Middleware\OutputGuardrail;
 use AiWorkflow\PromptData;
+use AiWorkflow\Responses\Usage;
 use AiWorkflow\SchemaBuilder;
 use AiWorkflow\StructuredDataResult;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Fixtures\Data\AddressData;
 use AiWorkflow\Tests\Fixtures\Data\DefaultedData;
 use AiWorkflow\Tests\Fixtures\Data\NestedDefaultsData;
@@ -26,20 +33,9 @@ use AiWorkflow\Tests\Fixtures\Data\TeamData;
 use AiWorkflow\Tests\Fixtures\Data\TypedSentimentData;
 use AiWorkflow\Tests\Fixtures\Data\ValidatedConfidenceData;
 use Closure;
-use Exception;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Exceptions\PrismException;
-use Prism\Prism\Exceptions\PrismRateLimitedException;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Schema\ArraySchema;
-use Prism\Prism\Schema\EnumSchema;
-use Prism\Prism\Schema\NumberSchema;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Schema\StringSchema;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
-use Prism\Prism\ValueObjects\Usage;
+use GuzzleHttp\Promise\PromiseInterface;
 use RuntimeException;
+use Spatie\LaravelData\Data;
 
 class SchemaBuilderTest extends TestCase
 {
@@ -48,83 +44,67 @@ class SchemaBuilderTest extends TestCase
     public function test_generates_schema_from_simple_data_class(): void
     {
         $schema = SchemaBuilder::fromDataClass(SentimentData::class);
+        $array = $schema->toArray();
 
-        $this->assertInstanceOf(ObjectSchema::class, $schema);
-        $this->assertSame('SentimentData', $schema->name);
-        $this->assertCount(2, $schema->properties);
-        $this->assertSame(['sentiment', 'confidence'], $schema->requiredFields);
+        $this->assertSame('SentimentData', $schema->name());
+        $this->assertSame('SentimentData', $array['description']);
+        $this->assertSame(['sentiment', 'confidence'], array_keys($array['properties']));
+        $this->assertSame(['sentiment', 'confidence'], $array['required']);
+        $this->assertFalse($array['additionalProperties']);
     }
 
     public function test_maps_string_to_string_schema(): void
     {
-        $schema = SchemaBuilder::fromDataClass(SentimentData::class);
-
-        $this->assertInstanceOf(StringSchema::class, $schema->properties[0]);
-        $this->assertSame('sentiment', $schema->properties[0]->name);
+        $this->assertSame('string', $this->property(SentimentData::class, 'sentiment')['type']);
     }
 
     public function test_maps_float_to_number_schema(): void
     {
-        $schema = SchemaBuilder::fromDataClass(SentimentData::class);
-
-        $this->assertInstanceOf(NumberSchema::class, $schema->properties[1]);
-        $this->assertSame('confidence', $schema->properties[1]->name);
+        $this->assertSame('number', $this->property(SentimentData::class, 'confidence')['type']);
     }
 
     public function test_maps_int_to_number_schema(): void
     {
-        $schema = SchemaBuilder::fromDataClass(PersonData::class);
-
-        $this->assertInstanceOf(NumberSchema::class, $schema->properties[1]);
-        $this->assertSame('age', $schema->properties[1]->name);
+        $this->assertSame('number', $this->property(PersonData::class, 'age')['type']);
     }
 
     public function test_description_attribute_used_for_descriptions(): void
     {
-        $schema = SchemaBuilder::fromDataClass(SentimentData::class);
-
-        $this->assertSame('The detected sentiment: positive, negative, or neutral', $schema->properties[0]->description);
-        $this->assertSame('Confidence score from 0.0 to 1.0', $schema->properties[1]->description);
+        $this->assertSame('The detected sentiment: positive, negative, or neutral', $this->property(SentimentData::class, 'sentiment')['description']);
+        $this->assertSame('Confidence score from 0.0 to 1.0', $this->property(SentimentData::class, 'confidence')['description']);
     }
 
     public function test_falls_back_to_property_name_without_description(): void
     {
-        $schema = SchemaBuilder::fromDataClass(AddressData::class);
-
-        $this->assertSame('street', $schema->properties[0]->description);
-        $this->assertSame('city', $schema->properties[1]->description);
+        $this->assertSame('street', $this->property(AddressData::class, 'street')['description']);
+        $this->assertSame('city', $this->property(AddressData::class, 'city')['description']);
     }
 
     public function test_maps_backed_enum_to_enum_schema(): void
     {
-        $schema = SchemaBuilder::fromDataClass(TypedSentimentData::class);
+        $type = $this->property(TypedSentimentData::class, 'type');
 
-        $this->assertInstanceOf(EnumSchema::class, $schema->properties[0]);
-        $this->assertSame('type', $schema->properties[0]->name);
-        $this->assertSame(['positive', 'negative', 'neutral'], $schema->properties[0]->options);
+        $this->assertSame(['positive', 'negative', 'neutral'], $type['enum']);
+        $this->assertSame('string', $type['type']);
     }
 
     public function test_nullable_property_is_still_required(): void
     {
-        $schema = SchemaBuilder::fromDataClass(TypedSentimentData::class);
-
-        $this->assertSame(['type', 'reason'], $schema->requiredFields);
+        $this->assertSame(['type', 'reason'], SchemaBuilder::fromDataClass(TypedSentimentData::class)->toArray()['required']);
     }
 
     public function test_required_lists_every_property(): void
     {
         foreach ([SentimentData::class, PersonData::class, TeamData::class, TypedSentimentData::class, DefaultedData::class] as $dataClass) {
-            $schema = SchemaBuilder::fromDataClass($dataClass);
-            $propertyNames = array_map(fn ($property) => $property->name(), $schema->properties);
+            $array = SchemaBuilder::fromDataClass($dataClass)->toArray();
 
-            $this->assertSame($propertyNames, $schema->requiredFields, "required for {$dataClass} must list every key in properties (OpenAI strict mode)");
+            $this->assertSame(array_keys($array['properties']), $array['required'], "required for {$dataClass} must list every key in properties (OpenAI strict mode)");
         }
     }
 
     public function test_defaulted_property_is_nullable_so_the_model_can_decline(): void
     {
-        $schema = SchemaBuilder::fromDataClass(DefaultedData::class);
-        $array = $schema->toArray();
+        $array = SchemaBuilder::fromDataClass(DefaultedData::class)->toArray();
 
         // 'language' is a non-nullable PHP string, widened so its default has a null to fall back on.
         $this->assertSame(['string', 'null'], $array['properties']['language']['type']);
@@ -194,18 +174,13 @@ class SchemaBuilderTest extends TestCase
 
     public function test_send_structured_data_applies_nested_defaults(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured([
-                    'name' => 'Jane',
-                    'address' => ['street' => 'Main St', 'country' => null],
-                    'previous' => [['street' => 'Old Rd', 'country' => null]],
-                ])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured([
+            'name' => 'Jane',
+            'address' => ['street' => 'Main St', 'country' => null],
+            'previous' => [['street' => 'Old Rd', 'country' => null]],
+        ]));
 
-        $service = app(AiService::class);
-        $result = $service->sendStructuredData(
+        $result = app(AiService::class)->sendStructuredData(
             collect([new UserMessage('Where does Jane live?')]),
             new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Extract the address.'),
             NestedDefaultsData::class,
@@ -229,104 +204,56 @@ class SchemaBuilderTest extends TestCase
 
     public function test_nested_object_required_lists_every_property(): void
     {
-        $schema = SchemaBuilder::fromDataClass(PersonData::class);
+        $address = $this->property(PersonData::class, 'address');
 
-        /** @var ObjectSchema $addressSchema */
-        $addressSchema = $schema->properties[2];
-        $propertyNames = array_map(fn ($property) => $property->name(), $addressSchema->properties);
-
-        $this->assertSame($propertyNames, $addressSchema->requiredFields);
+        $this->assertSame(array_keys($address['properties']), $address['required']);
     }
 
-    public function test_nullable_property_sets_nullable_flag(): void
+    public function test_nullable_property_allows_null(): void
     {
-        $schema = SchemaBuilder::fromDataClass(TypedSentimentData::class);
-
-        /** @var StringSchema $reasonSchema */
-        $reasonSchema = $schema->properties[1];
-        $this->assertInstanceOf(StringSchema::class, $reasonSchema);
-        $this->assertTrue($reasonSchema->nullable);
+        $this->assertSame(['string', 'null'], $this->property(TypedSentimentData::class, 'reason')['type']);
     }
 
     public function test_nested_data_class_maps_to_object_schema(): void
     {
-        $schema = SchemaBuilder::fromDataClass(PersonData::class);
+        $address = $this->property(PersonData::class, 'address');
 
-        /** @var ObjectSchema $addressSchema */
-        $addressSchema = $schema->properties[2];
-        $this->assertInstanceOf(ObjectSchema::class, $addressSchema);
-        $this->assertSame('address', $addressSchema->name);
-        $this->assertCount(2, $addressSchema->properties);
-        $this->assertSame(['street', 'city'], $addressSchema->requiredFields);
-    }
-
-    public function test_schema_to_array_produces_valid_json_schema(): void
-    {
-        $schema = SchemaBuilder::fromDataClass(SentimentData::class);
-        $array = $schema->toArray();
-
-        $this->assertSame('object', $array['type']);
-        $this->assertArrayHasKey('properties', $array);
-        $this->assertArrayHasKey('sentiment', $array['properties']);
-        $this->assertArrayHasKey('confidence', $array['properties']);
-        $this->assertSame(['sentiment', 'confidence'], $array['required']);
+        $this->assertSame('object', $address['type']);
+        $this->assertSame('Home address', $address['description']);
+        $this->assertSame(['street', 'city'], $address['required']);
     }
 
     // --- ArrayItemType ---
 
     public function test_array_without_attribute_defaults_to_string_items(): void
     {
-        $schema = SchemaBuilder::fromDataClass(TeamData::class);
+        $tags = $this->property(TeamData::class, 'tags');
 
-        /** @var ArraySchema $tagsSchema */
-        $tagsSchema = $schema->properties[1];
-        $this->assertInstanceOf(ArraySchema::class, $tagsSchema);
-        $this->assertSame('tags', $tagsSchema->name);
-        $this->assertInstanceOf(StringSchema::class, $tagsSchema->items);
+        $this->assertSame('array', $tags['type']);
+        $this->assertSame(['description' => 'Array item', 'type' => 'string'], $tags['items']);
     }
 
     public function test_array_with_scalar_item_type(): void
     {
-        $schema = SchemaBuilder::fromDataClass(TeamData::class);
-
-        /** @var ArraySchema $scoresSchema */
-        $scoresSchema = $schema->properties[2];
-        $this->assertInstanceOf(ArraySchema::class, $scoresSchema);
-        $this->assertSame('scores', $scoresSchema->name);
-        $this->assertInstanceOf(NumberSchema::class, $scoresSchema->items);
+        $this->assertSame(['description' => 'Array item', 'type' => 'number'], $this->property(TeamData::class, 'scores')['items']);
     }
 
     public function test_array_with_data_class_item_type(): void
     {
-        $schema = SchemaBuilder::fromDataClass(TeamData::class);
+        $items = $this->property(TeamData::class, 'members')['items'];
 
-        /** @var ArraySchema $membersSchema */
-        $membersSchema = $schema->properties[3];
-        $this->assertInstanceOf(ArraySchema::class, $membersSchema);
-        $this->assertSame('members', $membersSchema->name);
-        $this->assertInstanceOf(ObjectSchema::class, $membersSchema->items);
-
-        /** @var ObjectSchema $itemSchema */
-        $itemSchema = $membersSchema->items;
-        $this->assertCount(3, $itemSchema->properties);
+        $this->assertSame('object', $items['type']);
+        $this->assertSame('Array item', $items['description']);
+        $this->assertSame(['name', 'age', 'address'], array_keys($items['properties']));
     }
 
     // --- sendStructuredData ---
 
     public function test_send_structured_data_returns_validated_instance(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'positive', 'confidence' => 0.95])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['sentiment' => 'positive', 'confidence' => 0.95]));
 
-        $service = app(AiService::class);
-        $result = $service->sendStructuredData(
-            collect([new UserMessage('Analyze this text')]),
-            new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze sentiment.'),
-            SentimentData::class,
-        );
+        $result = $this->sendSentiment();
 
         $this->assertInstanceOf(StructuredDataResult::class, $result);
         $this->assertInstanceOf(SentimentData::class, $result->data);
@@ -336,43 +263,33 @@ class SchemaBuilderTest extends TestCase
 
     public function test_send_structured_data_retries_on_validation_failure(): void
     {
-        Prism::fake([
+        OpenRouterFake::respondWith(
             // First attempt: missing required field
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop),
+            OpenRouterFake::structured(['confidence' => 0.5]),
             // Second attempt: valid
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'negative', 'confidence' => 0.8])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $service = app(AiService::class);
-        $result = $service->sendStructuredData(
-            collect([new UserMessage('Analyze')]),
-            new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-            SentimentData::class,
+            OpenRouterFake::structured(['sentiment' => 'negative', 'confidence' => 0.8]),
         );
 
-        $this->assertInstanceOf(StructuredDataResult::class, $result);
-        $this->assertInstanceOf(SentimentData::class, $result->data);
+        $result = $this->sendSentiment();
+
         $this->assertSame('negative', $result->data->sentiment);
+
+        $messages = OpenRouterFake::sentBodies()[1]['messages'];
+        $this->assertIsArray($messages);
+        $this->assertSame(['role' => 'assistant', 'content' => '{"confidence":0.5}'], $messages[2]);
+        $this->assertIsArray($messages[3]);
+        $this->assertStringStartsWith('The previous response failed validation:', $messages[3]['content']);
     }
 
     public function test_send_structured_data_enforces_validation_rules(): void
     {
-        Prism::fake([
+        OpenRouterFake::respondWith(
             // Out of the range the Data class declares.
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 150])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 85])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+            OpenRouterFake::structured(['confidence' => 150]),
+            OpenRouterFake::structured(['confidence' => 85]),
+        );
 
-        $service = app(AiService::class);
-        $result = $service->sendStructuredData(
+        $result = app(AiService::class)->sendStructuredData(
             collect([new UserMessage('How confident are you?')]),
             new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Answer.'),
             ValidatedConfidenceData::class,
@@ -384,15 +301,14 @@ class SchemaBuilderTest extends TestCase
 
     public function test_send_structured_data_throws_when_validation_never_passes(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()->withStructured(['confidence' => 150])->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()->withStructured(['confidence' => 200])->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::structured(['confidence' => 150]),
+            OpenRouterFake::structured(['confidence' => 200]),
+        );
 
         $this->expectException(StructuredValidationException::class);
 
-        $service = app(AiService::class);
-        $service->sendStructuredData(
+        app(AiService::class)->sendStructuredData(
             collect([new UserMessage('How confident are you?')]),
             new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Answer.'),
             ValidatedConfidenceData::class,
@@ -402,48 +318,26 @@ class SchemaBuilderTest extends TestCase
 
     public function test_send_structured_data_throws_after_max_attempts(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.6])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::structured(['confidence' => 0.5]),
+            OpenRouterFake::structured(['confidence' => 0.6]),
+        );
 
         $this->expectException(StructuredValidationException::class);
 
-        $service = app(AiService::class);
-        $service->sendStructuredData(
-            collect([new UserMessage('Analyze')]),
-            new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-            SentimentData::class,
-            maxAttempts: 2,
-        );
+        $this->sendSentiment(maxAttempts: 2);
     }
 
     public function test_structured_validation_exception_tracks_attempts(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::structured(['confidence' => 0.5]),
+            OpenRouterFake::structured(['confidence' => 0.5]),
+            OpenRouterFake::structured(['confidence' => 0.5]),
+        );
 
         try {
-            $service = app(AiService::class);
-            $service->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-                maxAttempts: 3,
-            );
+            $this->sendSentiment(maxAttempts: 3);
             $this->fail('Expected StructuredValidationException');
         } catch (StructuredValidationException $e) {
             $this->assertSame(3, $e->attempts);
@@ -453,128 +347,92 @@ class SchemaBuilderTest extends TestCase
 
     public function test_send_structured_data_result_includes_response_and_usage(): void
     {
-        $usage = new Usage(100, 50, thoughtTokens: 30);
+        OpenRouterFake::respondWith(self::reply(['sentiment' => 'positive', 'confidence' => 0.95], 100, 50, thought: 30));
 
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'positive', 'confidence' => 0.95])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage($usage),
-        ]);
+        $result = $this->sendSentiment();
 
-        $service = app(AiService::class);
-        $result = $service->sendStructuredData(
-            collect([new UserMessage('Analyze this text')]),
-            new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze sentiment.'),
-            SentimentData::class,
-        );
-
-        $this->assertInstanceOf(StructuredDataResult::class, $result);
-        $this->assertSame(100, $result->usage->promptTokens);
-        $this->assertSame(50, $result->usage->completionTokens);
-        $this->assertSame(30, $result->usage->thoughtTokens);
+        $this->assertEquals(new Usage(100, 50, thoughtTokens: 30), $result->usage);
         $this->assertEquals($result->response->usage, $result->usage);
         $this->assertSame(FinishReason::Stop, $result->response->finishReason);
     }
 
     public function test_send_structured_data_usage_adds_up_every_attempt(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50, cacheReadInputTokens: 20, thoughtTokens: 10)),
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'negative', 'confidence' => 0.8])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(120, 60, thoughtTokens: 5)),
-        ]);
-
-        $service = app(AiService::class);
-        $result = $service->sendStructuredData(
-            collect([new UserMessage('Analyze')]),
-            new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-            SentimentData::class,
+        OpenRouterFake::respondWith(
+            self::reply(['confidence' => 0.5], 100, 50, cacheRead: 20, thought: 10),
+            self::reply(['sentiment' => 'negative', 'confidence' => 0.8], 120, 60, thought: 5),
         );
 
-        $this->assertEquals(new Usage(220, 110, cacheReadInputTokens: 20, thoughtTokens: 15), $result->usage);
+        $result = $this->sendSentiment();
+
+        $this->assertEquals(new Usage(220, 110, cacheReadTokens: 20, thoughtTokens: 15), $result->usage);
         $this->assertEquals(new Usage(120, 60, thoughtTokens: 5), $result->response->usage);
     }
 
     public function test_structured_validation_exception_carries_the_usage_of_every_attempt(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50, cacheWriteInputTokens: 40)),
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.6])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(120, 60)),
-        ]);
+        OpenRouterFake::respondWith(
+            self::reply(['confidence' => 0.5], 100, 50, cacheWrite: 40),
+            self::reply(['confidence' => 0.6], 120, 60),
+        );
 
         try {
-            app(AiService::class)->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-                maxAttempts: 2,
-            );
+            $this->sendSentiment(maxAttempts: 2);
             $this->fail('Expected StructuredValidationException');
         } catch (StructuredValidationException $e) {
-            $this->assertEquals(new Usage(220, 110, cacheWriteInputTokens: 40), $e->usage());
+            $this->assertEquals(new Usage(220, 110, cacheWriteTokens: 40), $e->usage());
         }
     }
 
     public function test_send_structured_data_wraps_a_failed_request_with_the_usage_of_earlier_attempts(): void
     {
-        // Attempt 2 throws because the fake has no second response queued.
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50)),
-        ]);
+        OpenRouterFake::respondWith(
+            self::reply(['confidence' => 0.5], 100, 50),
+            OpenRouterFake::error(400, 'Invalid request'),
+        );
 
         try {
-            app(AiService::class)->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-            );
+            $this->sendSentiment();
             $this->fail('Expected StructuredDataRequestException');
         } catch (StructuredDataRequestException $e) {
             $this->assertSame(2, $e->attempts);
             $this->assertEquals(new Usage(100, 50), $e->usage());
-            $this->assertInstanceOf(Exception::class, $e->getPrevious());
+            $this->assertInstanceOf(ProviderRequestException::class, $e->getPrevious());
             $this->assertSame($e->getPrevious()->getMessage(), $e->getMessage());
+            $this->assertSame(400, $e->getCode());
         }
     }
 
     public function test_send_structured_data_counts_a_response_rejected_for_its_finish_reason(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50)),
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'negative', 'confidence' => 0.8])
-                ->withFinishReason(FinishReason::Error)
-                ->withUsage(new Usage(120, 60)),
-        ]);
+        config()->set('ai-workflow.retry.times', 1);
+        OpenRouterFake::respondWith(
+            self::reply(['confidence' => 0.5], 100, 50),
+            OpenRouterFake::completion('{"sentiment":"negative","confidence":0.8}', 'error', ['prompt_tokens' => 120, 'completion_tokens' => 60]),
+        );
 
         try {
-            app(AiService::class)->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-            );
+            $this->sendSentiment();
             $this->fail('Expected StructuredDataRequestException');
         } catch (StructuredDataRequestException $e) {
             $this->assertEquals(new Usage(220, 110), $e->usage());
-            $this->assertInstanceOf(PrismException::class, $e->getPrevious());
+            $this->assertInstanceOf(UnexpectedFinishReasonException::class, $e->getPrevious());
+        }
+    }
+
+    public function test_a_retried_finish_reason_counts_every_rejected_response(): void
+    {
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('', 'error', ['prompt_tokens' => 120, 'completion_tokens' => 60]),
+            OpenRouterFake::completion('', 'error', ['prompt_tokens' => 120, 'completion_tokens' => 60]),
+            OpenRouterFake::completion('', 'error', ['prompt_tokens' => 120, 'completion_tokens' => 60]),
+        );
+
+        try {
+            $this->sendSentiment();
+            $this->fail('Expected StructuredDataRequestException');
+        } catch (StructuredDataRequestException $e) {
+            $this->assertEquals(new Usage(360, 180), $e->usage());
         }
     }
 
@@ -590,11 +448,7 @@ class SchemaBuilderTest extends TestCase
         });
 
         try {
-            $service->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-            );
+            $this->sendSentiment($service);
             $this->fail('Expected StructuredDataRequestException');
         } catch (StructuredDataRequestException $e) {
             $this->assertSame(429, $e->getCode());
@@ -608,21 +462,17 @@ class SchemaBuilderTest extends TestCase
         {
             public function handle(AiWorkflowContext $context, Closure $next): AiWorkflowContext
             {
-                throw PrismRateLimitedException::make();
+                throw new RateLimitedException('Slow down', 'openrouter', 429);
             }
         });
 
         try {
-            $service->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-            );
+            $this->sendSentiment($service);
             $this->fail('Expected StructuredDataRequestException');
         } catch (StructuredDataRequestException $e) {
             $this->assertSame(1, $e->attempts);
-            $this->assertEquals(new Usage(0, 0), $e->usage());
-            $this->assertInstanceOf(PrismRateLimitedException::class, $e->getPrevious());
+            $this->assertEquals(new Usage, $e->usage());
+            $this->assertInstanceOf(RateLimitedException::class, $e->getPrevious());
         }
     }
 
@@ -639,25 +489,15 @@ class SchemaBuilderTest extends TestCase
 
         $this->expectException(GuardrailViolationException::class);
 
-        $service->sendStructuredData(
-            collect([new UserMessage('Analyze')]),
-            new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-            SentimentData::class,
-        );
+        $this->sendSentiment($service);
     }
 
     public function test_send_structured_data_adds_earlier_usage_to_a_guardrail_violation(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50)),
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.6])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(120, 60)),
-        ]);
+        OpenRouterFake::respondWith(
+            self::reply(['confidence' => 0.5], 100, 50),
+            self::reply(['confidence' => 0.6], 120, 60),
+        );
 
         $guardrail = new class extends InputGuardrail
         {
@@ -677,11 +517,7 @@ class SchemaBuilderTest extends TestCase
         $service->addMiddleware($guardrail);
 
         try {
-            $service->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-            );
+            $this->sendSentiment($service);
             $this->fail('Expected GuardrailViolationException');
         } catch (GuardrailViolationException $e) {
             $this->assertSame($guardrail->thrown, $e);
@@ -691,16 +527,10 @@ class SchemaBuilderTest extends TestCase
 
     public function test_send_structured_data_counts_the_response_an_output_guardrail_rejected(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50)),
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'negative', 'confidence' => 0.8])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(120, 60)),
-        ]);
+        OpenRouterFake::respondWith(
+            self::reply(['confidence' => 0.5], 100, 50),
+            self::reply(['sentiment' => 'negative', 'confidence' => 0.8], 120, 60),
+        );
 
         $service = app(AiService::class);
         $service->addMiddleware(new class extends OutputGuardrail
@@ -716,14 +546,41 @@ class SchemaBuilderTest extends TestCase
         });
 
         try {
-            $service->sendStructuredData(
-                collect([new UserMessage('Analyze')]),
-                new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
-                SentimentData::class,
-            );
+            $this->sendSentiment($service);
             $this->fail('Expected GuardrailViolationException');
         } catch (GuardrailViolationException $e) {
             $this->assertEquals(new Usage(220, 110), $e->usage());
         }
+    }
+
+    private function sendSentiment(?AiService $service = null, int $maxAttempts = 3): StructuredDataResult
+    {
+        return ($service ?? app(AiService::class))->sendStructuredData(
+            collect([new UserMessage('Analyze')]),
+            new PromptData(id: 'test', model: 'openrouter:test-model', prompt: 'Analyze.'),
+            SentimentData::class,
+            $maxAttempts,
+        );
+    }
+
+    /**
+     * @param  class-string<Data>  $dataClass
+     * @return array<string, mixed>
+     */
+    private function property(string $dataClass, string $name): array
+    {
+        $properties = SchemaBuilder::fromDataClass($dataClass)->toArray()['properties'];
+        $this->assertIsArray($properties);
+        $this->assertIsArray($properties[$name]);
+
+        return $properties[$name];
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    private static function reply(array $data, int $input, int $output, ?int $cacheRead = null, ?int $cacheWrite = null, ?int $thought = null): PromiseInterface
+    {
+        return OpenRouterFake::structured($data, OpenRouterFake::tokens($input, $output, $cacheRead, $cacheWrite, $thought));
     }
 }

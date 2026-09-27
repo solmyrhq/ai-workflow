@@ -7,8 +7,8 @@ namespace AiWorkflow\Tests\Fixtures;
 use AiWorkflow\Eval\AiWorkflowEvalJudge;
 use AiWorkflow\Eval\AiWorkflowEvalResult;
 use AiWorkflow\Models\AiWorkflowRequest;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Text\Response;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
 
 /**
  * Reports whichever key the replayed response returned, and scores it against
@@ -16,9 +16,9 @@ use Prism\Prism\Text\Response;
  */
 class RecordsGroundTruthJudge implements AiWorkflowEvalJudge
 {
-    public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+    public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
     {
-        $structured = $response instanceof StructuredResponse ? ($response->structured ?? []) : [];
+        $structured = $response instanceof StructuredResponse ? $response->structured : [];
         $predicted = array_key_first($structured);
         $groundTruth = $originalRequest->getAttribute(AiWorkflowRequest::GROUND_TRUTH_ATTRIBUTE);
 

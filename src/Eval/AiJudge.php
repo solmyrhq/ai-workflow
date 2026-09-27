@@ -5,17 +5,15 @@ declare(strict_types=1);
 namespace AiWorkflow\Eval;
 
 use AiWorkflow\AiService;
+use AiWorkflow\Messages\Message;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Models\AiWorkflowRequest;
 use AiWorkflow\PromptData;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Schema\ResponseSchema;
 use Illuminate\Support\Collection;
 use Override;
-use Prism\Prism\Contracts\Message;
-use Prism\Prism\Schema\NumberSchema;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Schema\StringSchema;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Text\Response;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
 
 /**
  * Example AI-powered judge that compares an original response with a new one.
@@ -53,7 +51,7 @@ PROMPT;
     ) {}
 
     #[Override]
-    public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+    public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
     {
         $originalResponseText = $this->formatOriginalResponse($originalRequest);
         $newResponseText = $this->formatNewResponse($response);
@@ -68,15 +66,16 @@ PROMPT;
             prompt: $this->judgePrompt ?? self::DEFAULT_JUDGE_PROMPT,
         );
 
-        $schema = new ObjectSchema(
-            name: 'JudgeResult',
-            description: 'AI judge evaluation result',
-            properties: [
-                new NumberSchema('score', 'Semantic equivalence score from 0.0 to 1.0'),
-                new StringSchema('reasoning', 'Brief explanation of the score'),
+        $schema = new ResponseSchema('JudgeResult', [
+            'description' => 'AI judge evaluation result',
+            'type' => 'object',
+            'properties' => [
+                'score' => ['description' => 'Semantic equivalence score from 0.0 to 1.0', 'type' => 'number'],
+                'reasoning' => ['description' => 'Brief explanation of the score', 'type' => 'string'],
             ],
-            requiredFields: ['score', 'reasoning'],
-        );
+            'required' => ['score', 'reasoning'],
+            'additionalProperties' => false,
+        ]);
 
         $aiService = app(AiService::class);
 
@@ -89,8 +88,7 @@ PROMPT;
             $schema,
         );
 
-        /** @var array<string, mixed> $structured */
-        $structured = $judgeResponse->structured ?? [];
+        $structured = $judgeResponse->structured;
 
         $score = is_numeric($structured['score'] ?? null) ? (float) $structured['score'] : 0.0;
         $score = max(0.0, min(1.0, $score));
@@ -115,7 +113,7 @@ PROMPT;
         return $request->response_text ?? '(no response recorded)';
     }
 
-    private function formatNewResponse(Response|StructuredResponse $response): string
+    private function formatNewResponse(TextResponse|StructuredResponse $response): string
     {
         if ($response instanceof StructuredResponse) {
             return json_encode($response->structured, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT);

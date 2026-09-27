@@ -61,29 +61,26 @@ parameters:
         # Eloquent's fluent interface triggers this incorrectly.
         - identifier: staticMethod.dynamicCall
 
-        # Laravel Pipeline immediately invokes the middleware closure; exceptions propagate correctly.
-        -
-            identifier: shipmonk.checkedExceptionInCallable
-            count: 1
-            path: src/AiService.php
-
         # Generator methods must throw to signal errors to the consumer; this is the intended pattern.
         -
             identifier: shipmonk.checkedExceptionInYieldingMethod
-            count: 2
+            count: 1
             path: src/AiService.php
+        -
+            identifier: shipmonk.checkedExceptionInYieldingMethod
+            count: 3
+            path: src/Gateway/LlmClient.php
 
+        # The integration executor invokes the request closure immediately; exceptions propagate to the caller.
+        -
+            identifier: shipmonk.checkedExceptionInCallable
+            count: 2
+            path: src/Gateway/LlmClient.php
         # AiWorkflowContext is a mutable DTO passed through the middleware pipeline; properties must be writable.
         -
             identifier: shipmonk.publicPropertyNotReadonly
             count: 6
             path: src/Middleware/AiWorkflowContext.php
-
-        # Prism PHP union types include subtypes (Image/Document extend Media); we keep them explicit for API clarity.
-        -
-            identifier: shipmonk.nonNormalizedType
-            count: 6
-            path: src/MessageSerializer.php
 
         # Laravel facade @method tags cannot express callable parameter signatures.
         -

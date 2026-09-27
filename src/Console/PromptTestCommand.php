@@ -5,21 +5,17 @@ declare(strict_types=1);
 namespace AiWorkflow\Console;
 
 use AiWorkflow\AiService;
+use AiWorkflow\Messages\AssistantMessage;
+use AiWorkflow\Messages\Message;
+use AiWorkflow\Messages\SystemMessage;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\PromptData;
 use AiWorkflow\PromptService;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Schema\ResponseSchema;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
-use Prism\Prism\Contracts\Message;
-use Prism\Prism\Contracts\Schema;
-use Prism\Prism\Schema\BooleanSchema;
-use Prism\Prism\Schema\NumberSchema;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Schema\StringSchema;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Text\Response;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
-use Prism\Prism\ValueObjects\Messages\SystemMessage;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Symfony\Component\Yaml\Yaml;
 
 class PromptTestCommand extends Command
@@ -146,6 +142,9 @@ class PromptTestCommand extends Command
                 rawTemplate: $prompt->rawTemplate,
                 tags: $prompt->tags,
                 cacheTtl: $prompt->cacheTtl,
+                variables: $prompt->variables,
+                reasoning: $prompt->reasoning,
+                maxTokens: $prompt->maxTokens,
             );
         }
 
@@ -210,7 +209,7 @@ class PromptTestCommand extends Command
     /**
      * @param  array<string, mixed>  $assertions
      */
-    private function runAssertions(string $name, array $assertions, Response|StructuredResponse $response): void
+    private function runAssertions(string $name, array $assertions, TextResponse|StructuredResponse $response): void
     {
         $failures = [];
 
@@ -256,33 +255,38 @@ class PromptTestCommand extends Command
     }
 
     /**
-     * Build a simple ObjectSchema from the structured assertion keys.
+     * Build a simple schema from the structured assertion keys.
      *
      * @param  array<string, mixed>  $assertions
      */
-    private function buildSchemaFromAssertions(array $assertions): ObjectSchema
+    private function buildSchemaFromAssertions(array $assertions): ResponseSchema
     {
         /** @var array<string, mixed> $structured */
         $structured = is_array($assertions['structured'] ?? null) ? $assertions['structured'] : [];
 
-        /** @var list<Schema> $properties */
         $properties = [];
-        $required = [];
 
         foreach ($structured as $key => $value) {
-            $properties[] = match (true) {
-                is_int($value), is_float($value) => new NumberSchema($key, $key),
-                is_bool($value) => new BooleanSchema($key, $key),
-                default => new StringSchema($key, $key),
-            };
-            $required[] = $key;
+            $properties[$key] = [
+                'description' => $key,
+                'type' => match (true) {
+                    is_int($value), is_float($value) => 'number',
+                    is_bool($value) => 'boolean',
+                    default => 'string',
+                },
+            ];
         }
 
-        return new ObjectSchema(
-            name: 'PromptTestSchema',
-            description: 'Auto-generated schema from test assertions',
-            properties: $properties,
-            requiredFields: $required,
-        );
+        $schema = ['description' => 'Auto-generated schema from test assertions', 'type' => 'object'];
+
+        if ($properties !== []) {
+            $schema['properties'] = $properties;
+        }
+
+        return new ResponseSchema('PromptTestSchema', [
+            ...$schema,
+            'required' => array_keys($structured),
+            'additionalProperties' => false,
+        ]);
     }
 }

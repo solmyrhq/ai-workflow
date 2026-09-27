@@ -5,13 +5,22 @@ declare(strict_types=1);
 namespace AiWorkflow\Tests;
 
 use AiWorkflow\AiWorkflowReplayer;
+use AiWorkflow\Enums\FinishReason;
 use AiWorkflow\Eval\AiJudge;
 use AiWorkflow\Eval\AiWorkflowEvalJudge;
 use AiWorkflow\Eval\AiWorkflowEvalResult;
 use AiWorkflow\Eval\AiWorkflowEvalRunner;
+use AiWorkflow\Exceptions\ProviderRequestException;
+use AiWorkflow\Exceptions\RateLimitedException;
+use AiWorkflow\Exceptions\UnexpectedFinishReasonException;
 use AiWorkflow\Models\AiWorkflowEvalRun;
 use AiWorkflow\Models\AiWorkflowEvalScore;
 use AiWorkflow\Models\AiWorkflowRequest;
+use AiWorkflow\Responses\ResponseMeta;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Responses\Usage;
+use AiWorkflow\Testing\OpenRouterFake;
 use GuzzleHttp\Psr7\Response as PsrResponse;
 use Illuminate\Database\Eloquent\JsonEncodingException;
 use Illuminate\Http\Client\RequestException;
@@ -19,17 +28,6 @@ use Illuminate\Http\Client\Response as HttpClientResponse;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use Mockery\MockInterface;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Exceptions\PrismException;
-use Prism\Prism\Exceptions\PrismRateLimitedException;
-use Prism\Prism\Exceptions\PrismRequestTooLargeException;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\Text\Response;
-use Prism\Prism\ValueObjects\Meta;
-use Prism\Prism\ValueObjects\Usage;
 use RuntimeException;
 
 class EvalFrameworkTest extends DatabaseTestCase
@@ -38,11 +36,7 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_ai_judge_compares_original_and_new_response(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['score' => 0.85, 'reasoning' => 'Semantically equivalent with minor wording differences'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['score' => 0.85, 'reasoning' => 'Semantically equivalent with minor wording differences']));
 
         $request = $this->createTextRequest(responseText: 'The billing department handles your request.');
         $response = $this->makeTextResponse('Your request is handled by the billing team.');
@@ -53,82 +47,57 @@ class EvalFrameworkTest extends DatabaseTestCase
         $this->assertSame(0.85, $result->score);
         $this->assertSame('Semantically equivalent with minor wording differences', $result->details['reasoning']);
         $this->assertSame('openrouter:test-model', $result->details['judge_model']);
+
+        $body = OpenRouterFake::sentBodies()[0];
+        $this->assertSame('JudgeResult', $body['response_format']['json_schema']['name']);
+        $this->assertStringContainsString('Your request is handled by the billing team.', $body['messages'][1]['content']);
     }
 
     public function test_ai_judge_handles_structured_responses(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['score' => 0.95, 'reasoning' => 'Same classification, minor case difference'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['score' => 0.95, 'reasoning' => 'Same classification, minor case difference']));
 
         $request = $this->createStructuredRequest(['intent' => 'billing', 'payer' => 'John Smith']);
         $response = $this->makeStructuredResponse(['intent' => 'billing', 'payer' => 'john smith']);
 
-        $judge = new AiJudge('openrouter:test-model');
-        $result = $judge->judge($request, $response);
+        $result = (new AiJudge('openrouter:test-model'))->judge($request, $response);
 
         $this->assertSame(0.95, $result->score);
     }
 
     public function test_ai_judge_clamps_score_to_valid_range(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['score' => 1.5, 'reasoning' => 'Overscored'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['score' => 1.5, 'reasoning' => 'Overscored']));
 
-        $request = $this->createTextRequest();
-        $response = $this->makeTextResponse('Some response');
-
-        $judge = new AiJudge('openrouter:test-model');
-        $result = $judge->judge($request, $response);
+        $result = (new AiJudge('openrouter:test-model'))->judge($this->createTextRequest(), $this->makeTextResponse('Some response'));
 
         $this->assertSame(1.0, $result->score);
     }
 
     public function test_ai_judge_accepts_custom_prompt(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['score' => 0.7, 'reasoning' => 'Custom assessment'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $request = $this->createTextRequest();
-        $response = $this->makeTextResponse('Some response');
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['score' => 0.7, 'reasoning' => 'Custom assessment']));
 
         $judge = new AiJudge('openrouter:test-model', judgePrompt: 'You are a strict judge.');
-        $result = $judge->judge($request, $response);
+        $result = $judge->judge($this->createTextRequest(), $this->makeTextResponse('Some response'));
 
         $this->assertSame(0.7, $result->score);
+        $this->assertSame(['role' => 'system', 'content' => 'You are a strict judge.'], OpenRouterFake::sentBodies()[0]['messages'][0]);
     }
 
     // --- AiWorkflowEvalRunner ---
 
     public function test_eval_runner_creates_run_and_scores(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello world')
-                ->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()
-                ->withText('Hi world')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello world'), OpenRouterFake::completion('Hi world'));
 
         $request = $this->createTextRequest(responseText: 'Hello world');
 
-        $judge = $this->alwaysScoreJudge(0.9);
-
-        $runner = app(AiWorkflowEvalRunner::class);
-        $evalRun = $runner->run(
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Test eval',
             requests: [$request],
             models: ['openrouter:model-a', 'openrouter:model-b'],
-            judge: $judge,
+            judge: $this->alwaysScoreJudge(0.9),
         );
 
         $this->assertInstanceOf(AiWorkflowEvalRun::class, $evalRun);
@@ -155,9 +124,7 @@ class EvalFrameworkTest extends DatabaseTestCase
             'duration_ms' => 100,
         ]);
 
-        $fake = Prism::fake([
-            TextResponseFake::make()->withText('Replayed')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Replayed'));
 
         app(AiWorkflowEvalRunner::class)->run(
             name: 'Prompt regression',
@@ -169,25 +136,19 @@ class EvalFrameworkTest extends DatabaseTestCase
         // Re-running the golden set after editing a prompt is the regression
         // test this framework exists for, so replaying the recorded text would
         // score a prompt nobody is using any more.
-        $fake->assertRequest(function (array $requests): void {
-            $this->assertSame('You are a helpful test assistant.', $requests[0]->systemPrompts()[0]->content);
-        });
+        $this->assertSame(
+            ['role' => 'system', 'content' => 'You are a helpful test assistant.'],
+            OpenRouterFake::sentBodies()[0]['messages'][0],
+        );
     }
 
     public function test_eval_runner_stores_structured_response(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => 'billing'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['intent' => 'billing']));
 
-        $request = $this->createStructuredRequest(['intent' => 'billing']);
-
-        $runner = app(AiWorkflowEvalRunner::class);
-        $evalRun = $runner->run(
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Structured eval',
-            requests: [$request],
+            requests: [$this->createStructuredRequest(['intent' => 'billing'])],
             models: ['openrouter:model-a'],
             judge: $this->alwaysScoreJudge(1.0),
         );
@@ -200,19 +161,11 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_records_replay_usage_and_latency(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => 'billing'])
-                ->withUsage(new Usage(15, 25))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['intent' => 'billing'], OpenRouterFake::tokens(15, 25)));
 
-        $request = $this->createStructuredRequest(['intent' => 'billing']);
-
-        $runner = app(AiWorkflowEvalRunner::class);
-        $evalRun = $runner->run(
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Usage eval',
-            requests: [$request],
+            requests: [$this->createStructuredRequest(['intent' => 'billing'])],
             models: ['openrouter:model-a'],
             judge: $this->alwaysScoreJudge(1.0),
         );
@@ -227,18 +180,11 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_records_replay_cache_tokens(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => 'billing'])
-                ->withUsage(new Usage(15, 25, cacheWriteInputTokens: 5, cacheReadInputTokens: 10))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $request = $this->createStructuredRequest(['intent' => 'billing']);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['intent' => 'billing'], OpenRouterFake::tokens(15, 25, cacheRead: 10, cacheWrite: 5)));
 
         $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Cache usage eval',
-            requests: [$request],
+            requests: [$this->createStructuredRequest(['intent' => 'billing'])],
             models: ['openrouter:model-a'],
             judge: $this->alwaysScoreJudge(1.0),
         );
@@ -251,18 +197,11 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_a_judge_failure_still_persists_the_replay_usage(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => 'billing'])
-                ->withUsage(new Usage(15, 25, thoughtTokens: 5))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $request = $this->createStructuredRequest(['intent' => 'billing']);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['intent' => 'billing'], OpenRouterFake::tokens(15, 25, reasoning: 5)));
 
         $judge = new class implements AiWorkflowEvalJudge
         {
-            public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+            public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
             {
                 throw new InvalidArgumentException('judge exploded');
             }
@@ -270,7 +209,7 @@ class EvalFrameworkTest extends DatabaseTestCase
 
         $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Judge failure eval',
-            requests: [$request],
+            requests: [$this->createStructuredRequest(['intent' => 'billing'])],
             models: ['openrouter:model-a'],
             judge: $judge,
         );
@@ -291,11 +230,7 @@ class EvalFrameworkTest extends DatabaseTestCase
         // A real run is hours of paid API calls. If results only landed at the
         // end, an interrupted run would throw away work already billed for — so
         // each score must be written as soon as it exists.
-        Prism::fake([
-            TextResponseFake::make()->withText('one')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('two')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('three')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('one'), OpenRouterFake::completion('two'), OpenRouterFake::completion('three'));
 
         $requests = [$this->createTextRequest(), $this->createTextRequest(), $this->createTextRequest()];
 
@@ -311,7 +246,7 @@ class EvalFrameworkTest extends DatabaseTestCase
              */
             public function __construct(private array &$seen, private array &$levels) {}
 
-            public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+            public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
             {
                 // How many scores are already visible at this point, and
                 // whether the runner has opened a transaction of its own.
@@ -341,24 +276,14 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_with_multiple_requests(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Response 1')
-                ->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()
-                ->withText('Response 2')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $request1 = $this->createTextRequest(responseText: 'Match 1');
-        $request2 = $this->createTextRequest(responseText: 'Match 2');
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Response 1'), OpenRouterFake::completion('Response 2'));
 
         $callCount = 0;
         $judge = new class($callCount) implements AiWorkflowEvalJudge
         {
             public function __construct(private int &$callCount) {}
 
-            public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+            public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
             {
                 $this->callCount++;
 
@@ -366,10 +291,9 @@ class EvalFrameworkTest extends DatabaseTestCase
             }
         };
 
-        $runner = app(AiWorkflowEvalRunner::class);
-        $evalRun = $runner->run(
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Multi-request eval',
-            requests: [$request1, $request2],
+            requests: [$this->createTextRequest(responseText: 'Match 1'), $this->createTextRequest(responseText: 'Match 2')],
             models: ['openrouter:model-a'],
             judge: $judge,
         );
@@ -380,18 +304,11 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_stores_config(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('test')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('test'));
 
-        $request = $this->createTextRequest();
-
-        $runner = app(AiWorkflowEvalRunner::class);
-        $evalRun = $runner->run(
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Config eval',
-            requests: [$request],
+            requests: [$this->createTextRequest()],
             models: ['openrouter:model-a'],
             judge: $this->alwaysScoreJudge(0.5),
             config: ['tag' => 'classification'],
@@ -405,11 +322,11 @@ class EvalFrameworkTest extends DatabaseTestCase
         $attempts = 0;
 
         $this->mock(AiWorkflowReplayer::class, function (MockInterface $mock) use (&$attempts): void {
-            $mock->shouldReceive('replay')->twice()->andReturnUsing(function () use (&$attempts): Response {
+            $mock->shouldReceive('replay')->twice()->andReturnUsing(function () use (&$attempts): TextResponse {
                 $attempts++;
 
                 if ($attempts === 1) {
-                    throw new PrismException('OpenRouter: unknown finish reason');
+                    throw new UnexpectedFinishReasonException(FinishReason::Unknown, 'openrouter');
                 }
 
                 return $this->makeTextResponse('Second time lucky');
@@ -429,10 +346,25 @@ class EvalFrameworkTest extends DatabaseTestCase
         $this->assertNull($score->details['error'] ?? null);
     }
 
+    public function test_eval_runner_retries_a_real_replay_that_ended_with_an_unknown_finish_reason(): void
+    {
+        OpenRouterFake::respondWith(OpenRouterFake::completion('', 'weird'), OpenRouterFake::completion('Recovered'));
+
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
+            name: 'Real retry eval',
+            requests: [$this->createTextRequest()],
+            models: ['openrouter:model-a'],
+            judge: $this->alwaysScoreJudge(1.0),
+        );
+
+        $this->assertSame('Recovered', $evalRun->scores->first()?->response_text);
+        $this->assertCount(2, OpenRouterFake::sentBodies());
+    }
+
     public function test_eval_runner_gives_up_after_the_configured_attempts(): void
     {
         $this->mock(AiWorkflowReplayer::class, function (MockInterface $mock): void {
-            $mock->shouldReceive('replay')->twice()->andThrow(new PrismException('OpenRouter: unknown finish reason'));
+            $mock->shouldReceive('replay')->twice()->andThrow(new UnexpectedFinishReasonException(FinishReason::Unknown, 'openrouter'));
         });
 
         $evalRun = app(AiWorkflowEvalRunner::class)->run(
@@ -445,19 +377,16 @@ class EvalFrameworkTest extends DatabaseTestCase
         $score = $evalRun->scores->first();
         $this->assertNotNull($score);
         $this->assertSame(0.0, (float) $score->score);
-        $this->assertStringContainsString('unknown finish reason', (string) ($score->details['error'] ?? ''));
+        $this->assertStringContainsString('Unexpected AI finish reason', (string) ($score->details['error'] ?? ''));
     }
 
     public function test_eval_runner_does_not_retry_a_request_the_provider_rejected(): void
     {
+        // The status is on a previous exception, so the retry classifier must
+        // walk the chain.
         $httpResponse = new HttpClientResponse(new PsrResponse(404, [], '{"error":"model unavailable"}'));
-        $rejected = PrismException::providerRequestError(
-            'openrouter:model-a',
-            new RequestException($httpResponse),
-        );
+        $rejected = new RuntimeException('Replay failed', previous: new RequestException($httpResponse));
 
-        // Prism does not copy the status from the RequestException to the outer
-        // PrismException. The retry classifier must inspect the exception chain.
         $this->mock(AiWorkflowReplayer::class, function (MockInterface $mock) use ($rejected): void {
             $mock->shouldReceive('replay')->once()->andThrow($rejected);
         });
@@ -475,7 +404,7 @@ class EvalFrameworkTest extends DatabaseTestCase
     public function test_eval_runner_does_not_retry_a_request_that_is_too_large(): void
     {
         $this->mock(AiWorkflowReplayer::class, function (MockInterface $mock): void {
-            $mock->shouldReceive('replay')->once()->andThrow(PrismRequestTooLargeException::make('openrouter'));
+            $mock->shouldReceive('replay')->once()->andThrow(new ProviderRequestException('Request too large', 'openrouter', 413));
         });
 
         $evalRun = app(AiWorkflowEvalRunner::class)->run(
@@ -506,15 +435,13 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_retries_a_rate_limit_with_the_provider_delay(): void
     {
-        config()->set('ai-workflow.retry.rate_limit_delay_ms', 0);
-
         $attempts = 0;
         $this->mock(AiWorkflowReplayer::class, function (MockInterface $mock) use (&$attempts): void {
-            $mock->shouldReceive('replay')->twice()->andReturnUsing(function () use (&$attempts): Response {
+            $mock->shouldReceive('replay')->twice()->andReturnUsing(function () use (&$attempts): TextResponse {
                 $attempts++;
 
                 if ($attempts === 1) {
-                    throw PrismRateLimitedException::make();
+                    throw new RateLimitedException('Slow down', 'openrouter', 429);
                 }
 
                 return $this->makeTextResponse('Recovered after throttling');
@@ -533,23 +460,14 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_handles_partial_failure(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Good response')
-                ->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()
-                ->withText('Good response')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $request = $this->createTextRequest(responseText: 'Original');
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Good response'), OpenRouterFake::completion('Good response'));
 
         $callCount = 0;
         $judge = new class($callCount) implements AiWorkflowEvalJudge
         {
             public function __construct(private int &$callCount) {}
 
-            public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+            public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
             {
                 $this->callCount++;
                 if ($this->callCount === 1) {
@@ -560,10 +478,9 @@ class EvalFrameworkTest extends DatabaseTestCase
             }
         };
 
-        $runner = app(AiWorkflowEvalRunner::class);
-        $evalRun = $runner->run(
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Partial failure eval',
-            requests: [$request],
+            requests: [$this->createTextRequest(responseText: 'Original')],
             models: ['openrouter:model-a', 'openrouter:model-b'],
             judge: $judge,
         );
@@ -583,20 +500,14 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_a_replayed_answer_holding_a_non_finite_number_scores_as_a_failed_replay(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => ['confidence' => -INF]])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => 'billing'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $request = $this->createStructuredRequest(['intent' => 'billing']);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('{"intent":{"confidence":-1e999}}'),
+            OpenRouterFake::structured(['intent' => 'billing']),
+        );
 
         $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Non-finite answer',
-            requests: [$request],
+            requests: [$this->createStructuredRequest(['intent' => 'billing'])],
             models: ['openrouter:model-a', 'openrouter:model-b'],
             judge: $this->alwaysScoreJudge(1.0),
         );
@@ -606,7 +517,7 @@ class EvalFrameworkTest extends DatabaseTestCase
         $this->assertEqualsWithDelta(0.0, (float) $scoreA->score, 0.0001);
         $this->assertNull($scoreA->structured_response);
         $this->assertIsString($scoreA->details['error'] ?? null);
-        $this->assertStringContainsString('could not be decoded', $scoreA->details['error']);
+        $this->assertStringContainsString('too large to represent', $scoreA->details['error']);
 
         $scoreB = $evalRun->scores->where('model', 'openrouter:model-b')->first();
         $this->assertNotNull($scoreB);
@@ -615,13 +526,7 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_surfaces_score_persistence_failures(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Good response')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $request = $this->createTextRequest();
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Good response'));
 
         // INF can't be JSON-encoded, so persisting this (successful) result
         // throws — a storage fault, not a replay/judge one.
@@ -630,7 +535,7 @@ class EvalFrameworkTest extends DatabaseTestCase
         try {
             app(AiWorkflowEvalRunner::class)->run(
                 name: 'Persistence failure',
-                requests: [$request],
+                requests: [$this->createTextRequest()],
                 models: ['openrouter:model-a'],
                 judge: $judge,
             );
@@ -660,18 +565,11 @@ class EvalFrameworkTest extends DatabaseTestCase
 
     public function test_eval_runner_with_custom_judge(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('anything')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('anything'));
 
-        $request = $this->createTextRequest();
-
-        $runner = app(AiWorkflowEvalRunner::class);
-        $evalRun = $runner->run(
+        $evalRun = app(AiWorkflowEvalRunner::class)->run(
             name: 'Custom judge eval',
-            requests: [$request],
+            requests: [$this->createTextRequest()],
             models: ['openrouter:model-a'],
             judge: $this->alwaysScoreJudge(0.75, ['custom' => true]),
         );
@@ -726,7 +624,7 @@ class EvalFrameworkTest extends DatabaseTestCase
              */
             public function __construct(private readonly float $score, private readonly array $details) {}
 
-            public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+            public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
             {
                 return new AiWorkflowEvalResult($this->score, $this->details);
             }
@@ -777,18 +675,9 @@ class EvalFrameworkTest extends DatabaseTestCase
         ]);
     }
 
-    private function makeTextResponse(string $text): Response
+    private function makeTextResponse(string $text): TextResponse
     {
-        return new Response(
-            steps: collect([]),
-            text: $text,
-            finishReason: FinishReason::Stop,
-            toolCalls: [],
-            toolResults: [],
-            usage: new Usage(10, 20),
-            meta: new Meta(id: 'test', model: 'test-model'),
-            messages: collect([]),
-        );
+        return new TextResponse($text, FinishReason::Stop, new Usage(10, 20), new ResponseMeta('test', 'test-model'));
     }
 
     /**
@@ -797,12 +686,11 @@ class EvalFrameworkTest extends DatabaseTestCase
     private function makeStructuredResponse(array $structured): StructuredResponse
     {
         return new StructuredResponse(
-            steps: collect([]),
-            text: json_encode($structured, JSON_THROW_ON_ERROR),
-            structured: $structured,
-            finishReason: FinishReason::Stop,
-            usage: new Usage(10, 20),
-            meta: new Meta(id: 'test', model: 'test-model'),
+            $structured,
+            json_encode($structured, JSON_THROW_ON_ERROR),
+            FinishReason::Stop,
+            new Usage(10, 20),
+            new ResponseMeta('test', 'test-model'),
         );
     }
 }

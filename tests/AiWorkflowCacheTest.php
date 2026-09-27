@@ -6,21 +6,16 @@ namespace AiWorkflow\Tests;
 
 use AiWorkflow\AiService;
 use AiWorkflow\AiWorkflowCache;
+use AiWorkflow\Enums\FinishReason;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Middleware\AiWorkflowContext;
 use AiWorkflow\Middleware\AiWorkflowMiddleware;
+use AiWorkflow\Responses\Usage;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Concerns\MakesTestFixtures;
 use AiWorkflow\Tests\Fixtures\Data\SentimentData;
 use Closure;
 use Illuminate\Support\Facades\Exceptions;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Schema\StringSchema;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
-use Prism\Prism\ValueObjects\Meta;
-use Prism\Prism\ValueObjects\Usage;
 use RuntimeException;
 
 class AiWorkflowCacheTest extends TestCase
@@ -51,59 +46,47 @@ class AiWorkflowCacheTest extends TestCase
     public function test_schema_affects_cache_key(): void
     {
         $cache = app(AiWorkflowCache::class);
-        $schema = new ObjectSchema('test', 'desc', [new StringSchema('a', 'b')], ['a']);
 
         $withoutSchema = $cache->generateKey('openrouter', 'test', 'system', [new UserMessage('Hello')]);
-        $withSchema = $cache->generateKey('openrouter', 'test', 'system', [new UserMessage('Hello')], $schema);
+        $withSchema = $cache->generateKey('openrouter', 'test', 'system', [new UserMessage('Hello')], $this->makeSchema());
 
         $this->assertNotSame($withoutSchema, $withSchema);
     }
 
     public function test_cache_hit_returns_cached_text_response(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Original response')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Original response'));
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: 3600);
 
-        // First call — cache miss, hits Prism.
         $response1 = $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
         $this->assertSame('Original response', $response1->text);
 
-        // Second call — cache hit, does not hit Prism (no more fakes needed).
         $response2 = $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
         $this->assertSame('Original response', $response2->text);
+        $this->assertCount(1, OpenRouterFake::sentBodies());
     }
 
     public function test_cache_hit_returns_cached_structured_response(): void
     {
-        $schema = new ObjectSchema('test', 'desc', [new StringSchema('answer', 'The answer')], ['answer']);
-
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'cached'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'cached']));
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: 3600);
 
-        $response1 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $schema);
+        $response1 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $this->makeSchema());
         $this->assertSame(['answer' => 'cached'], $response1->structured);
 
         // Cache hit.
-        $response2 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $schema);
+        $response2 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $this->makeSchema());
         $this->assertSame(['answer' => 'cached'], $response2->structured);
+        $this->assertCount(1, OpenRouterFake::sentBodies());
     }
 
     public function test_cache_miss_when_different_messages(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('First'), OpenRouterFake::completion('Second'));
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: 3600);
@@ -117,10 +100,7 @@ class AiWorkflowCacheTest extends TestCase
 
     public function test_cache_skipped_when_no_ttl(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('First'), OpenRouterFake::completion('Second'));
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: null);
@@ -136,10 +116,7 @@ class AiWorkflowCacheTest extends TestCase
     {
         config()->set('ai-workflow.cache.enabled', false);
 
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('First'), OpenRouterFake::completion('Second'));
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: 3600);
@@ -153,73 +130,74 @@ class AiWorkflowCacheTest extends TestCase
 
     public function test_cache_hit_preserves_text_usage_and_meta(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Response with meta')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50))
-                ->withMeta(new Meta('request-123', 'gpt-4')),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Response with meta', usage: ['prompt_tokens' => 100, 'completion_tokens' => 50]));
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: 3600);
 
         $response1 = $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
-        $this->assertSame(100, $response1->usage->promptTokens);
-        $this->assertSame(50, $response1->usage->completionTokens);
-        $this->assertSame('request-123', $response1->meta->id);
-        $this->assertSame('gpt-4', $response1->meta->model);
+        $this->assertSame(100, $response1->usage->inputTokens);
+        $this->assertSame(50, $response1->usage->outputTokens);
+        $this->assertSame('gen-fake', $response1->meta->id);
+        $this->assertSame(OpenRouterFake::MODEL, $response1->meta->model);
 
         // Cache hit should preserve usage and meta.
         $response2 = $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
         $this->assertSame('Response with meta', $response2->text);
-        $this->assertSame(100, $response2->usage->promptTokens);
-        $this->assertSame(50, $response2->usage->completionTokens);
-        $this->assertSame('request-123', $response2->meta->id);
-        $this->assertSame('gpt-4', $response2->meta->model);
+        $this->assertSame(100, $response2->usage->inputTokens);
+        $this->assertSame(50, $response2->usage->outputTokens);
+        $this->assertSame('gen-fake', $response2->meta->id);
+        $this->assertSame(OpenRouterFake::MODEL, $response2->meta->model);
     }
 
     public function test_cache_hit_preserves_structured_usage_and_meta(): void
     {
-        $schema = new ObjectSchema('test', 'desc', [new StringSchema('answer', 'The answer')], ['answer']);
-
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'cached'])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(200, 100))
-                ->withMeta(new Meta('req-456', 'claude-4')),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'cached'], ['prompt_tokens' => 200, 'completion_tokens' => 100]));
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: 3600);
 
-        $response1 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $schema);
-        $this->assertSame(200, $response1->usage->promptTokens);
-        $this->assertSame(100, $response1->usage->completionTokens);
-        $this->assertSame('req-456', $response1->meta->id);
+        $response1 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $this->makeSchema());
+        $this->assertSame(200, $response1->usage->inputTokens);
+        $this->assertSame(100, $response1->usage->outputTokens);
+        $this->assertSame('gen-fake', $response1->meta->id);
 
         // Cache hit should preserve usage and meta.
-        $response2 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $schema);
+        $response2 = $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $prompt, $this->makeSchema());
         $this->assertSame(['answer' => 'cached'], $response2->structured);
-        $this->assertSame(200, $response2->usage->promptTokens);
-        $this->assertSame(100, $response2->usage->completionTokens);
-        $this->assertSame('req-456', $response2->meta->id);
-        $this->assertSame('claude-4', $response2->meta->model);
+        $this->assertSame(200, $response2->usage->inputTokens);
+        $this->assertSame(100, $response2->usage->outputTokens);
+        $this->assertSame('gen-fake', $response2->meta->id);
+        $this->assertSame(OpenRouterFake::MODEL, $response2->meta->model);
+    }
+
+    public function test_an_entry_cached_by_6x_still_reads(): void
+    {
+        $cache = app(AiWorkflowCache::class);
+        $messages = [new UserMessage('Hello')];
+        $key = $cache->generateKey('openrouter', 'test-model', 'You are a helpful assistant.', $messages);
+
+        $cache->put($key, [
+            'text' => 'Cached before the upgrade',
+            'finish_reason' => 'length',
+            'usage' => ['prompt_tokens' => 30, 'completion_tokens' => 12, 'thought_tokens' => 4],
+            'meta' => ['id' => 'gen-old', 'model' => 'anthropic/claude-sonnet-4'],
+        ], 3600);
+
+        $response = app(AiService::class)->sendMessages(collect($messages), $this->makePrompt(cacheTtl: 3600));
+
+        $this->assertSame('Cached before the upgrade', $response->text);
+        $this->assertSame(FinishReason::Length, $response->finishReason);
+        $this->assertEquals(new Usage(30, 12, thoughtTokens: 4), $response->usage);
+        $this->assertSame('gen-old', $response->meta->id);
     }
 
     public function test_send_structured_data_caches_only_the_validated_answer(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['confidence' => 0.5])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50)),
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'positive', 'confidence' => 0.9])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(120, 60)),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::structured(['confidence' => 0.5], ['prompt_tokens' => 100, 'completion_tokens' => 50]),
+            OpenRouterFake::structured(['sentiment' => 'positive', 'confidence' => 0.9], ['prompt_tokens' => 120, 'completion_tokens' => 60]),
+        );
 
         $service = app(AiService::class);
         $prompt = $this->makePrompt(cacheTtl: 3600);
@@ -230,7 +208,7 @@ class AiWorkflowCacheTest extends TestCase
         $second = $service->sendStructuredData(collect([new UserMessage('Analyze')]), $prompt, SentimentData::class);
         $this->assertInstanceOf(SentimentData::class, $second->data);
         $this->assertSame('positive', $second->data->sentiment);
-        $this->assertEquals(new Usage(0, 0), $second->usage);
+        $this->assertEquals(new Usage, $second->usage);
     }
 
     public function test_send_structured_data_reports_a_cache_write_failure_and_returns_the_result(): void
@@ -238,16 +216,12 @@ class AiWorkflowCacheTest extends TestCase
         $this->failCacheWrites();
         Exceptions::fake();
 
-        $fake = Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['sentiment' => 'positive', 'confidence' => 0.9])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['sentiment' => 'positive', 'confidence' => 0.9]));
 
         $result = app(AiService::class)->sendStructuredData(collect([new UserMessage('Analyze')]), $this->makePrompt(cacheTtl: 3600), SentimentData::class);
 
         $this->assertSame('positive', $result->data->sentiment);
-        $fake->assertCallCount(1);
+        $this->assertCount(1, OpenRouterFake::sentBodies());
         Exceptions::assertReported(fn (RuntimeException $e): bool => $e->getMessage() === 'Cache store is down');
     }
 
@@ -256,9 +230,7 @@ class AiWorkflowCacheTest extends TestCase
         $this->failCacheWrites();
         Exceptions::fake();
 
-        Prism::fake([
-            TextResponseFake::make()->withText('Fine')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Fine'));
 
         $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt(cacheTtl: 3600));
 
@@ -268,9 +240,7 @@ class AiWorkflowCacheTest extends TestCase
 
     public function test_cache_hits_when_middleware_rewrites_the_messages(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Original response')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Original response'));
 
         $service = app(AiService::class);
         $service->addMiddleware(new class implements AiWorkflowMiddleware

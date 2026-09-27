@@ -1,0 +1,93 @@
+[
+    {
+        "type": "system",
+        "content": "You are a careful assistant."
+    },
+    {
+        "type": "user",
+        "content": "Plain question"
+    },
+    {
+        "type": "user",
+        "content": "Look at these",
+        "additional_content": [
+            {
+                "media_type": "image",
+                "base64": "iVBORw0KGgo=",
+                "mime_type": "image/png"
+            },
+            {
+                "media_type": "document",
+                "base64": "JVBERi0xLjQ=",
+                "mime_type": "application/pdf",
+                "document_title": "Invoice"
+            },
+            {
+                "media_type": "audio",
+                "base64": "SUQzBAA=",
+                "mime_type": "audio/mpeg"
+            },
+            {
+                "media_type": "video",
+                "base64": "AAAAIGZ0eXA=",
+                "mime_type": "video/mp4"
+            },
+            {
+                "media_type": "media",
+                "base64": "AAAA",
+                "mime_type": "application/octet-stream"
+            },
+            {
+                "media_type": "text",
+                "text": "Extra context"
+            }
+        ]
+    },
+    {
+        "type": "assistant",
+        "content": "Let me check.",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "name": "lookup_order",
+                "arguments": {
+                    "id": "A-1",
+                    "verbose": true
+                }
+            },
+            {
+                "id": "call_2",
+                "name": "weather",
+                "arguments": []
+            }
+        ]
+    },
+    {
+        "type": "tool_result",
+        "tool_results": [
+            {
+                "tool_call_id": "call_1",
+                "tool_name": "lookup_order",
+                "args": {
+                    "id": "A-1",
+                    "verbose": true
+                },
+                "result": "Shipped"
+            },
+            {
+                "tool_call_id": "call_2",
+                "tool_name": "weather",
+                "args": [],
+                "result": {
+                    "temp": 21.5,
+                    "unit": "C"
+                }
+            }
+        ]
+    },
+    {
+        "type": "assistant",
+        "content": "Order A-1 shipped and it is 21.5C.",
+        "tool_calls": []
+    }
+]

@@ -138,13 +138,7 @@ class EvalReportMetrics
             thoughtTokens: $thoughtTokens,
             cacheReadTokens: $cacheReadTokens,
             cacheWriteTokens: $cacheWriteTokens,
-            cost: $this->costFor(
-                $model,
-                $inputTokens,
-                $cacheReadTokens,
-                $cacheWriteTokens,
-                $this->billedOutputTokens($model, $outputTokens, $thoughtTokens),
-            ),
+            cost: $this->costFor($model, $inputTokens, $cacheReadTokens, $cacheWriteTokens, $outputTokens),
             medianLatencyMs: Statistics::percentile($latencies, 0.5),
             p95LatencyMs: Statistics::percentile($latencies, 0.95),
         );
@@ -556,20 +550,8 @@ class EvalReportMetrics
     }
 
     /**
-     * Adds thought tokens only when the provider's output count excludes
-     * them. Gemini's API excludes them; OpenRouter's count includes them,
-     * even for Gemini models.
-     */
-    private function billedOutputTokens(string $model, int $outputTokens, int $thoughtTokens): int
-    {
-        $provider = explode(':', $model, 2)[0];
-
-        return $provider === 'gemini' ? $outputTokens + $thoughtTokens : $outputTokens;
-    }
-
-    /**
-     * Prism's input token count excludes cache reads and writes for OpenAI
-     * and Anthropic, and includes them for OpenRouter and Gemini.
+     * The formula assumes that, for every provider, input tokens include
+     * cache reads and writes and output tokens include thought tokens.
      */
     private function costFor(string $model, int $inputTokens, int $cacheReadTokens, int $cacheWriteTokens, int $outputTokens): ?float
     {
@@ -579,10 +561,7 @@ class EvalReportMetrics
             return null;
         }
 
-        $provider = explode(':', $model, 2)[0];
-        $uncachedInputTokens = in_array($provider, ['openai', 'anthropic'], true)
-            ? $inputTokens
-            : max(0, $inputTokens - $cacheReadTokens - $cacheWriteTokens);
+        $uncachedInputTokens = max(0, $inputTokens - $cacheReadTokens - $cacheWriteTokens);
 
         return (($uncachedInputTokens / 1_000_000) * $pricing['input'])
             + (($cacheReadTokens / 1_000_000) * ($pricing['cache_read'] ?? $pricing['input']))

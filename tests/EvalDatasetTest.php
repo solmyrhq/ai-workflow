@@ -10,11 +10,9 @@ use AiWorkflow\Models\AiWorkflowEvalDataset;
 use AiWorkflow\Models\AiWorkflowEvalDatasetEntry;
 use AiWorkflow\Models\AiWorkflowExecution;
 use AiWorkflow\Models\AiWorkflowRequest;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\Text\Response;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Testing\OpenRouterFake;
 
 class EvalDatasetTest extends DatabaseTestCase
 {
@@ -210,11 +208,7 @@ class EvalDatasetTest extends DatabaseTestCase
 
     public function test_run_evaluates_dataset(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
         $execution = $this->createExecution(requestCount: 1);
         $dataset = AiWorkflowEvalDataset::create(['name' => 'my-dataset']);
@@ -234,10 +228,7 @@ class EvalDatasetTest extends DatabaseTestCase
 
     public function test_run_evaluates_multiple_executions(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('A')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('B')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('A'), OpenRouterFake::completion('B'));
 
         $execution1 = $this->createExecution('exec-1', requestCount: 1);
         $execution2 = $this->createExecution('exec-2', requestCount: 1);
@@ -260,7 +251,7 @@ class EvalDatasetTest extends DatabaseTestCase
  */
 class FixedScoreJudge implements AiWorkflowEvalJudge
 {
-    public function judge(AiWorkflowRequest $originalRequest, Response|StructuredResponse $response): AiWorkflowEvalResult
+    public function judge(AiWorkflowRequest $originalRequest, TextResponse|StructuredResponse $response): AiWorkflowEvalResult
     {
         return new AiWorkflowEvalResult(0.5);
     }

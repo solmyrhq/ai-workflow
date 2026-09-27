@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace AiWorkflow;
 
+use InvalidArgumentException;
+
 class PromptData
 {
     /**
@@ -33,7 +35,7 @@ class PromptData
     ];
 
     /**
-     * Translate the reasoning setting into provider-specific options for withProviderOptions().
+     * Translate the reasoning setting into the provider's request body fields.
      *
      * @return array<string, mixed>
      */
@@ -48,8 +50,8 @@ class PromptData
         return match ($provider) {
             'anthropic' => $this->resolveAnthropicReasoning($reasoning, $maxTokens),
             'gemini' => $this->resolveGeminiReasoning($reasoning),
-            'ollama' => $reasoning === 'none' ? [] : ['thinking' => true],
-            'xai' => $reasoning === 'none' ? [] : ['thinking' => ['enabled' => true]],
+            'ollama' => $reasoning === 'none' ? [] : ['think' => true],
+            'xai' => $this->resolveXaiReasoning($reasoning),
             default => $this->resolveDefaultReasoning($reasoning),
         };
     }
@@ -67,24 +69,44 @@ class PromptData
             ? $reasoning
             : $this->effortToBudgetTokens($reasoning, $maxTokens);
 
-        return ['thinking' => ['enabled' => true, 'budgetTokens' => $budgetTokens]];
+        return ['thinking' => ['type' => 'enabled', 'budget_tokens' => $budgetTokens]];
     }
 
     /**
+     * Gemini cannot turn thinking off, so "none" is sent as the lowest level,
+     * "minimal".
+     *
      * @return array<string, mixed>
      */
     private function resolveGeminiReasoning(string|int $reasoning): array
     {
-        if ($reasoning === 'none') {
-            return ['thinkingBudget' => 0];
-        }
-
         if (is_int($reasoning)) {
-            return ['thinkingBudget' => $reasoning];
+            throw new InvalidArgumentException("Prompt '{$this->id}' has a reasoning budget of {$reasoning} tokens, but Gemini only accepts an effort level (minimal, low, medium or high).");
         }
 
-        // Gemini 3 supports minimal/low/medium/high; map xhigh to high.
-        return ['thinkingLevel' => $reasoning === 'xhigh' ? 'high' : $reasoning];
+        return ['thinking_level' => match ($reasoning) {
+            'none' => 'minimal',
+            'xhigh' => 'high',
+            default => $reasoning,
+        }];
+    }
+
+    /**
+     * xAI's reasoning_effort field accepts only "low" and "high".
+     *
+     * @return array<string, mixed>
+     */
+    private function resolveXaiReasoning(string|int $reasoning): array
+    {
+        if (is_int($reasoning)) {
+            throw new InvalidArgumentException("Prompt '{$this->id}' has a reasoning budget of {$reasoning} tokens, but xAI only accepts an effort level.");
+        }
+
+        return match ($reasoning) {
+            'none' => [],
+            'minimal', 'low' => ['reasoning_effort' => 'low'],
+            default => ['reasoning_effort' => 'high'],
+        };
     }
 
     /**

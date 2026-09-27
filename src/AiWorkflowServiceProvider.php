@@ -17,6 +17,8 @@ use AiWorkflow\Eval\AiWorkflowEvalRunner;
 use AiWorkflow\Eval\GoldenSetAssembler;
 use AiWorkflow\Events\AiWorkflowRequestCompleted;
 use AiWorkflow\Events\AiWorkflowRequestFailed;
+use AiWorkflow\Gateway\LlmClient;
+use AiWorkflow\Gateway\ProviderFactory;
 use AiWorkflow\Integrations\OpenRouterProvider;
 use AiWorkflow\Listeners\SentryBreadcrumbListener;
 use Illuminate\Support\Facades\Event;
@@ -35,6 +37,8 @@ class AiWorkflowServiceProvider extends ServiceProvider
             'openrouter' => OpenRouterProvider::class,
         ]);
 
+        $this->app->singleton(ProviderFactory::class);
+        $this->app->singleton(LlmClient::class);
         $this->app->singleton(AiService::class);
         $this->app->singleton(PromptService::class);
         $this->app->singleton(AiWorkflowReplayer::class);

@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Events;
 
+use AiWorkflow\Enums\FinishReason;
 use AiWorkflow\PromptData;
+use AiWorkflow\Responses\Usage;
 use Illuminate\Foundation\Events\Dispatchable;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\ValueObjects\Usage;
 
 class AiWorkflowRequestCompleted
 {

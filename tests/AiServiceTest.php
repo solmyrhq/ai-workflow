@@ -5,58 +5,29 @@ declare(strict_types=1);
 namespace AiWorkflow\Tests;
 
 use AiWorkflow\AiService;
+use AiWorkflow\Enums\FinishReason;
 use AiWorkflow\Events\AiWorkflowRequestFailed;
+use AiWorkflow\Exceptions\StructuredDecodingException;
+use AiWorkflow\Exceptions\UnexpectedFinishReasonException;
+use AiWorkflow\Exceptions\UpstreamErrorException;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Middleware\AiWorkflowContext;
 use AiWorkflow\Middleware\AiWorkflowMiddleware;
 use AiWorkflow\Models\AiWorkflowExecution;
 use AiWorkflow\PromptData;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Streaming\StreamEnd;
+use AiWorkflow\Streaming\StreamEvent;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Concerns\MakesTestFixtures;
+use AiWorkflow\Tools\Tool;
 use Closure;
-use Generator;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Event;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Enums\Provider as ProviderEnum;
-use Prism\Prism\Exceptions\PrismException;
-use Prism\Prism\Exceptions\PrismStructuredDecodingException;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Facades\Tool;
-use Prism\Prism\PrismManager;
-use Prism\Prism\Providers\Provider;
-use Prism\Prism\Streaming\Events\StreamEndEvent;
-use Prism\Prism\Streaming\Events\StreamStartEvent;
-use Prism\Prism\Structured\Request as StructuredRequest;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Testing\PrismFake;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\Text\Request as TextRequest;
-use Prism\Prism\Text\Response;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
-use Prism\Prism\ValueObjects\Meta;
-use Prism\Prism\ValueObjects\Usage;
 use RuntimeException;
 
 class AiServiceTest extends TestCase
 {
     use MakesTestFixtures;
-
-    private function makeTextResponse(
-        string $text = 'Hello from AI',
-        FinishReason $finishReason = FinishReason::Stop,
-    ): Response {
-        return new Response(
-            steps: new Collection,
-            text: $text,
-            finishReason: $finishReason,
-            toolCalls: [],
-            toolResults: [],
-            usage: new Usage(100, 50),
-            meta: new Meta('test-model', 'test-id'),
-            messages: new Collection,
-        );
-    }
 
     // --- Model Identifier Parsing ---
 
@@ -82,23 +53,17 @@ class AiServiceTest extends TestCase
 
     public function test_get_tools_returns_empty_array_by_default(): void
     {
-        $service = app(AiService::class);
-
-        $this->assertSame([], $service->getTools());
+        $this->assertSame([], app(AiService::class)->getTools());
     }
 
     public function test_resolve_tools_using_registers_tools(): void
     {
         $service = app(AiService::class);
-
-        $tool = Tool::as('test_tool')
-            ->for('A test tool.')
-            ->using(fn (): string => 'result');
+        $tool = new Tool('test_tool', 'A test tool.', [], fn (): string => 'result');
 
         $service->resolveToolsUsing(fn (): array => [$tool]);
 
-        $tools = $service->getTools();
-        $this->assertCount(1, $tools);
+        $this->assertSame([$tool], $service->getTools());
     }
 
     public function test_tool_resolver_receives_context(): void
@@ -118,6 +83,25 @@ class AiServiceTest extends TestCase
         $this->assertSame(['customer' => 'test-customer'], $receivedContext);
     }
 
+    public function test_send_messages_runs_the_resolved_tools(): void
+    {
+        OpenRouterFake::respondWith(
+            OpenRouterFake::toolCalls([['name' => 'lookup_order', 'arguments' => ['id' => 'A-1']]]),
+            OpenRouterFake::completion('Order A-1 has shipped.'),
+        );
+
+        $service = app(AiService::class);
+        $service->resolveToolsUsing(fn (array $context): array => [
+            new Tool('lookup_order', 'Look up an order.', ['type' => 'object', 'properties' => ['id' => ['type' => 'string']]], fn (array $arguments): string => "{$context['status']}: {$arguments['id']}"),
+        ]);
+        $service->setContext(['status' => 'Shipped']);
+
+        $response = $service->sendMessages(collect([new UserMessage('Where is A-1?')]), $this->makePrompt());
+
+        $this->assertSame('Order A-1 has shipped.', $response->text);
+        $this->assertSame('Shipped: A-1', $response->toolResults[0]->result);
+    }
+
     public function test_set_context_and_get_context(): void
     {
         $service = app(AiService::class);
@@ -131,99 +115,75 @@ class AiServiceTest extends TestCase
 
     public function test_send_messages_returns_response(): void
     {
-        Prism::fake([
-            $this->makeTextResponse(),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello from AI'));
 
-        $service = app(AiService::class);
-        $response = $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
-        $this->assertInstanceOf(Response::class, $response);
+        $this->assertInstanceOf(TextResponse::class, $response);
         $this->assertSame('Hello from AI', $response->text);
+        $this->assertSame('test-model', OpenRouterFake::sentBodies()[0]['model']);
     }
 
     public function test_send_messages_includes_extra_context(): void
     {
-        Prism::fake([
-            $this->makeTextResponse('Response with context'),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Response with context'));
 
-        $service = app(AiService::class);
-        $extraContext = new PromptData(
-            id: 'extra',
-            model: 'openrouter:test-model',
-            prompt: 'Extra context.',
-        );
+        $extraContext = new PromptData(id: 'extra', model: 'openrouter:test-model', prompt: 'Extra context.');
 
-        $response = $service->sendMessages(
-            collect([new UserMessage('Hello')]),
-            $this->makePrompt(),
-            $extraContext,
-        );
+        $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $extraContext);
 
         $this->assertSame('Response with context', $response->text);
+        $this->assertSame(
+            ['role' => 'system', 'content' => "Extra context.\n\nYou are a helpful assistant."],
+            OpenRouterFake::sentBodies()[0]['messages'][0],
+        );
     }
 
     // --- Finish Reason Handling ---
 
     public function test_finish_reason_stop_succeeds(): void
     {
-        Prism::fake([
-            $this->makeTextResponse(finishReason: FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Done'));
 
-        $service = app(AiService::class);
-        $response = $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $this->assertSame(FinishReason::Stop, $response->finishReason);
     }
 
     public function test_finish_reason_tool_calls_succeeds(): void
     {
-        Prism::fake([
-            $this->makeTextResponse(finishReason: FinishReason::ToolCalls),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('', 'tool_calls'));
 
-        $service = app(AiService::class);
-        $response = $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $this->assertSame(FinishReason::ToolCalls, $response->finishReason);
     }
 
     public function test_finish_reason_unknown_throws(): void
     {
-        Prism::fake([
-            $this->makeTextResponse(finishReason: FinishReason::Unknown),
-        ]);
+        OpenRouterFake::respondWith(...array_fill(0, 3, OpenRouterFake::completion('', 'weird')));
 
-        $this->expectException(PrismException::class);
+        $this->expectException(UnexpectedFinishReasonException::class);
         $this->expectExceptionMessage('Unexpected AI finish reason: unknown');
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
     }
 
     public function test_finish_reason_error_throws(): void
     {
-        Prism::fake([
-            $this->makeTextResponse(finishReason: FinishReason::Error),
-        ]);
+        OpenRouterFake::respondWith(...array_fill(0, 3, OpenRouterFake::completion('', 'error')));
 
-        $this->expectException(PrismException::class);
+        $this->expectException(UnexpectedFinishReasonException::class);
         $this->expectExceptionMessage('Unexpected AI finish reason: error');
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
     }
 
     public function test_finish_reason_length_reports_but_returns(): void
     {
-        Prism::fake([
-            $this->makeTextResponse(finishReason: FinishReason::Length),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Truncated', 'length'));
 
-        $service = app(AiService::class);
-        $response = $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         // Length finish reason is reported but the response is still returned.
         $this->assertSame(FinishReason::Length, $response->finishReason);
@@ -231,12 +191,9 @@ class AiServiceTest extends TestCase
 
     public function test_finish_reason_content_filter_reports_but_returns(): void
     {
-        Prism::fake([
-            $this->makeTextResponse(finishReason: FinishReason::ContentFilter),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('', 'content_filter'));
 
-        $service = app(AiService::class);
-        $response = $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $this->assertSame(FinishReason::ContentFilter, $response->finishReason);
     }
@@ -245,245 +202,114 @@ class AiServiceTest extends TestCase
 
     public function test_send_structured_messages_returns_response(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'test'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'test']));
 
-        $service = app(AiService::class);
-        $response = $service->sendStructuredMessages(
-            collect([new UserMessage('Hello')]),
-            $this->makePrompt(),
-            $this->makeSchema(),
-        );
+        $response = app(AiService::class)->sendStructuredMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
 
-        $this->assertInstanceOf(StructuredResponse::class, $response);
         $this->assertSame(['answer' => 'test'], $response->structured);
+        $this->assertSame('test', OpenRouterFake::sentBodies()[0]['response_format']['json_schema']['name']);
     }
 
     // --- sendStructuredMessagesWithTools ---
 
     public function test_send_structured_messages_with_tools_happy_path(): void
     {
-        Prism::fake([
+        OpenRouterFake::respondWith(
             // First call: text response with tools
-            TextResponseFake::make()
-                ->withText('The answer is 42')
-                ->withMessages(collect([new AssistantMessage('The answer is 42')]))
-                ->withFinishReason(FinishReason::Stop),
+            OpenRouterFake::completion('The answer is 42'),
             // Second call: structured extraction
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => '42'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+            OpenRouterFake::structured(['answer' => '42']),
+        );
 
-        $service = app(AiService::class);
-        $response = $service->sendStructuredMessagesWithTools(
+        $response = app(AiService::class)->sendStructuredMessagesWithTools(
             collect([new UserMessage('What is the answer?')]),
             $this->makePrompt(),
             $this->makeSchema(),
         );
 
         $this->assertSame(['answer' => '42'], $response->structured);
-    }
 
-    public function test_send_structured_messages_with_tools_throws_when_no_assistant_message(): void
-    {
-        Prism::fake([
-            // Text response with no messages
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withMessages(collect([]))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('text step did not produce an assistant message');
-
-        $service = app(AiService::class);
-        $service->sendStructuredMessagesWithTools(
-            collect([new UserMessage('Hello')]),
-            $this->makePrompt(),
-            $this->makeSchema(),
-        );
+        $messages = OpenRouterFake::sentBodies()[1]['messages'];
+        $this->assertIsArray($messages);
+        $this->assertCount(1, $messages);
+        $this->assertIsArray($messages[0]);
+        $this->assertStringStartsWith('The answer is 42', $messages[0]['content']);
     }
 
     public function test_send_structured_messages_with_tools_throws_on_empty_assistant_content(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('')
-                ->withMessages(collect([new AssistantMessage('')]))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion(''));
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('text step did not produce an assistant message');
 
-        $service = app(AiService::class);
-        $service->sendStructuredMessagesWithTools(
-            collect([new UserMessage('Hello')]),
-            $this->makePrompt(),
-            $this->makeSchema(),
-        );
+        app(AiService::class)->sendStructuredMessagesWithTools(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
     }
 
     // --- streamMessages ---
 
     public function test_stream_messages_yields_events(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Streamed response')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::textStream(['Streamed ', 'response']));
 
-        $service = app(AiService::class);
-        $events = [];
-        $endEvent = null;
-
-        foreach ($service->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()) as $event) {
-            $events[] = $event;
-            if ($event instanceof StreamEndEvent) {
-                $endEvent = $event;
-            }
-        }
+        $events = $this->stream();
 
         $this->assertNotEmpty($events);
-        $this->assertNotNull($endEvent);
+        $endEvent = end($events);
+        $this->assertInstanceOf(StreamEnd::class, $endEvent);
         $this->assertSame(FinishReason::Stop, $endEvent->finishReason);
     }
 
     public function test_stream_messages_finish_reason_length_reports_but_returns(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Truncated')->withFinishReason(FinishReason::Length),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::textStream(['Truncated'], 'length'));
 
-        $service = app(AiService::class);
-        $endEvent = null;
+        $events = $this->stream();
+        $endEvent = end($events);
 
-        foreach ($service->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()) as $event) {
-            if ($event instanceof StreamEndEvent) {
-                $endEvent = $event;
-            }
-        }
-
-        $this->assertNotNull($endEvent);
+        $this->assertInstanceOf(StreamEnd::class, $endEvent);
         $this->assertSame(FinishReason::Length, $endEvent->finishReason);
     }
 
     public function test_stream_messages_finish_reason_content_filter_reports_but_returns(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Filtered')->withFinishReason(FinishReason::ContentFilter),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::textStream(['Filtered'], 'content_filter'));
 
-        $service = app(AiService::class);
-        $endEvent = null;
+        $events = $this->stream();
+        $endEvent = end($events);
 
-        foreach ($service->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()) as $event) {
-            if ($event instanceof StreamEndEvent) {
-                $endEvent = $event;
-            }
-        }
-
-        $this->assertNotNull($endEvent);
+        $this->assertInstanceOf(StreamEnd::class, $endEvent);
         $this->assertSame(FinishReason::ContentFilter, $endEvent->finishReason);
     }
 
     // --- Fallback Model ---
 
-    /**
-     * Install a custom PrismFake that throws PrismStructuredDecodingException
-     * on the first structured() call, then delegates to the normal fake for subsequent calls.
-     */
-    private function fakeWithStructuredDecodingFailure(StructuredResponse $fallbackResponse): PrismFake
-    {
-        $structuredCallCount = 0;
-        $inner = new PrismFake([$fallbackResponse]);
-
-        $fake = new class($inner, $structuredCallCount) extends PrismFake
-        {
-            private int $callCount = 0;
-
-            public function __construct(
-                private readonly PrismFake $inner,
-                int $initialCount,
-            ) {
-                parent::__construct([]);
-                $this->callCount = $initialCount;
-            }
-
-            public function structured(StructuredRequest $request): StructuredResponse
-            {
-                $this->callCount++;
-                if ($this->callCount === 1) {
-                    throw PrismStructuredDecodingException::make('invalid json');
-                }
-
-                return $this->inner->structured($request);
-            }
-        };
-
-        app()->instance(PrismManager::class, new class($fake) extends PrismManager
-        {
-            public function __construct(private readonly PrismFake $fake) {}
-
-            public function resolve(ProviderEnum|string $name, array $providerConfig = []): Provider
-            {
-                return $this->fake;
-            }
-        });
-
-        return $fake;
-    }
-
     public function test_structured_messages_falls_back_on_decoding_failure(): void
     {
-        $fallbackResponse = StructuredResponseFake::make()
-            ->withStructured(['answer' => 'from fallback'])
-            ->withFinishReason(FinishReason::Stop);
-
-        $this->fakeWithStructuredDecodingFailure($fallbackResponse);
-
-        $prompt = new PromptData(
-            id: 'fallback_test',
-            model: 'openrouter:primary-model',
-            prompt: 'You are helpful.',
-            fallbackModel: 'openrouter:fallback-model',
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('not json'),
+            OpenRouterFake::structured(['answer' => 'from fallback']),
         );
 
-        $service = app(AiService::class);
-        $response = $service->sendStructuredMessages(
+        $response = app(AiService::class)->sendStructuredMessages(
             collect([new UserMessage('Hello')]),
-            $prompt,
+            $this->makePrompt(model: 'openrouter:primary-model', fallbackModel: 'openrouter:fallback-model'),
             $this->makeSchema(),
         );
 
         $this->assertSame(['answer' => 'from fallback'], $response->structured);
+        $this->assertSame(['primary-model', 'fallback-model'], array_column(OpenRouterFake::sentBodies(), 'model'));
     }
 
     public function test_structured_messages_no_fallback_when_model_override_set(): void
     {
-        $fallbackResponse = StructuredResponseFake::make()
-            ->withStructured(['answer' => 'unused'])
-            ->withFinishReason(FinishReason::Stop);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('not json'));
 
-        $this->fakeWithStructuredDecodingFailure($fallbackResponse);
+        $this->expectException(StructuredDecodingException::class);
 
-        $prompt = new PromptData(
-            id: 'fallback_test',
-            model: 'openrouter:primary-model',
-            prompt: 'You are helpful.',
-            fallbackModel: 'openrouter:fallback-model',
-        );
-
-        $this->expectException(PrismStructuredDecodingException::class);
-
-        $service = app(AiService::class);
-        $service->sendStructuredMessages(
+        app(AiService::class)->sendStructuredMessages(
             collect([new UserMessage('Hello')]),
-            $prompt,
+            $this->makePrompt(model: 'openrouter:primary-model', fallbackModel: 'openrouter:fallback-model'),
             $this->makeSchema(),
             modelOverride: 'openrouter:override-model',
         );
@@ -491,35 +317,21 @@ class AiServiceTest extends TestCase
 
     public function test_structured_messages_no_fallback_when_no_fallback_model(): void
     {
-        $fallbackResponse = StructuredResponseFake::make()
-            ->withStructured(['answer' => 'unused'])
-            ->withFinishReason(FinishReason::Stop);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('not json'));
 
-        $this->fakeWithStructuredDecodingFailure($fallbackResponse);
+        $this->expectException(StructuredDecodingException::class);
 
-        $this->expectException(PrismStructuredDecodingException::class);
-
-        $service = app(AiService::class);
-        $service->sendStructuredMessages(
-            collect([new UserMessage('Hello')]),
-            $this->makePrompt(), // no fallbackModel
-            $this->makeSchema(),
-        );
+        app(AiService::class)->sendStructuredMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
     }
 
     public function test_structured_messages_fall_back_when_the_answer_holds_a_non_finite_number(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => ['likelihood' => INF]])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'from fallback'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('{"answer":{"likelihood":1e999}}'),
+            OpenRouterFake::structured(['answer' => 'from fallback']),
+        );
 
-        $service = app(AiService::class);
-        $response = $service->sendStructuredMessages(
+        $response = app(AiService::class)->sendStructuredMessages(
             collect([new UserMessage('Hello')]),
             $this->makePrompt(fallbackModel: 'openrouter:fallback-model'),
             $this->makeSchema(),
@@ -564,48 +376,27 @@ class AiServiceTest extends TestCase
     public function test_stream_messages_dispatches_failed_event_on_error(): void
     {
         Event::fake();
-
-        $fake = new class extends PrismFake
-        {
-            public function __construct()
-            {
-                parent::__construct([]);
-            }
-
-            public function stream(TextRequest $request): Generator
-            {
-                yield new StreamStartEvent(
-                    id: 'fake',
-                    timestamp: time(),
-                    model: 'test-model',
-                    provider: 'fake',
-                );
-
-                throw new RuntimeException('Stream failed mid-iteration');
-            }
-        };
-
-        app()->instance(PrismManager::class, new class($fake) extends PrismManager
-        {
-            public function __construct(private readonly PrismFake $fake) {}
-
-            public function resolve(ProviderEnum|string $name, array $providerConfig = []): Provider
-            {
-                return $this->fake;
-            }
-        });
-
-        $service = app(AiService::class);
+        OpenRouterFake::respondWith(OpenRouterFake::stream([
+            OpenRouterFake::chunk(['role' => 'assistant', 'content' => 'Partial']),
+            ['error' => ['code' => 502, 'message' => 'Stream failed mid-iteration']],
+        ]));
 
         try {
-            foreach ($service->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()) as $event) {
-                // consuming events
-            }
-            $this->fail('Expected RuntimeException was not thrown');
-        } catch (RuntimeException $e) {
-            $this->assertSame('Stream failed mid-iteration', $e->getMessage());
+            $this->stream();
+            $this->fail('Expected UpstreamErrorException was not thrown');
+        } catch (UpstreamErrorException $e) {
+            $this->assertSame('The openrouter stream failed: Stream failed mid-iteration', $e->getMessage());
+            $this->assertSame(502, $e->errorCode);
         }
 
         Event::assertDispatched(AiWorkflowRequestFailed::class);
+    }
+
+    /**
+     * @return list<StreamEvent>
+     */
+    private function stream(): array
+    {
+        return iterator_to_array(app(AiService::class)->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()), false);
     }
 }

@@ -1,0 +1,375 @@
+{
+    "AddressData": {
+        "name": "AddressData",
+        "schema": {
+            "description": "AddressData",
+            "type": "object",
+            "properties": {
+                "street": {
+                    "description": "street",
+                    "type": "string"
+                },
+                "city": {
+                    "description": "city",
+                    "type": "string"
+                }
+            },
+            "required": [
+                "street",
+                "city"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "DefaultedAddressData": {
+        "name": "DefaultedAddressData",
+        "schema": {
+            "description": "DefaultedAddressData",
+            "type": "object",
+            "properties": {
+                "street": {
+                    "description": "The street of the address",
+                    "type": "string"
+                },
+                "country": {
+                    "description": "The country of the address",
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                }
+            },
+            "required": [
+                "street",
+                "country"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "DefaultedData": {
+        "name": "DefaultedData",
+        "schema": {
+            "description": "DefaultedData",
+            "type": "object",
+            "properties": {
+                "sentiment": {
+                    "description": "The sentiment of the text",
+                    "type": "string"
+                },
+                "reason": {
+                    "description": "The reason for the sentiment",
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "language": {
+                    "description": "The language of the text, as an ISO 639-1 code",
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "tone": {
+                    "description": "The tone of the text",
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                }
+            },
+            "required": [
+                "sentiment",
+                "reason",
+                "language",
+                "tone"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "NestedDefaultsData": {
+        "name": "NestedDefaultsData",
+        "schema": {
+            "description": "NestedDefaultsData",
+            "type": "object",
+            "properties": {
+                "name": {
+                    "description": "The name of the resident",
+                    "type": "string"
+                },
+                "address": {
+                    "description": "The current address",
+                    "type": "object",
+                    "properties": {
+                        "street": {
+                            "description": "The street of the address",
+                            "type": "string"
+                        },
+                        "country": {
+                            "description": "The country of the address",
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    },
+                    "required": [
+                        "street",
+                        "country"
+                    ],
+                    "additionalProperties": false
+                },
+                "previous": {
+                    "description": "Addresses the resident lived at before",
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "description": "Array item",
+                        "type": "object",
+                        "properties": {
+                            "street": {
+                                "description": "The street of the address",
+                                "type": "string"
+                            },
+                            "country": {
+                                "description": "The country of the address",
+                                "type": [
+                                    "string",
+                                    "null"
+                                ]
+                            }
+                        },
+                        "required": [
+                            "street",
+                            "country"
+                        ],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": [
+                "name",
+                "address",
+                "previous"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "NullableNoDefaultData": {
+        "name": "NullableNoDefaultData",
+        "schema": {
+            "description": "NullableNoDefaultData",
+            "type": "object",
+            "properties": {
+                "category_id": {
+                    "description": "The ID of the chosen category, or null if no category fits",
+                    "type": [
+                        "number",
+                        "null"
+                    ]
+                },
+                "confidence": {
+                    "description": "Confidence in the chosen category, from 0 to 100",
+                    "type": "number"
+                }
+            },
+            "required": [
+                "category_id",
+                "confidence"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "PersonData": {
+        "name": "PersonData",
+        "schema": {
+            "description": "PersonData",
+            "type": "object",
+            "properties": {
+                "name": {
+                    "description": "Full name",
+                    "type": "string"
+                },
+                "age": {
+                    "description": "Age in years",
+                    "type": "number"
+                },
+                "address": {
+                    "description": "Home address",
+                    "type": "object",
+                    "properties": {
+                        "street": {
+                            "description": "street",
+                            "type": "string"
+                        },
+                        "city": {
+                            "description": "city",
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "street",
+                        "city"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "required": [
+                "name",
+                "age",
+                "address"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "SentimentData": {
+        "name": "SentimentData",
+        "schema": {
+            "description": "SentimentData",
+            "type": "object",
+            "properties": {
+                "sentiment": {
+                    "description": "The detected sentiment: positive, negative, or neutral",
+                    "type": "string"
+                },
+                "confidence": {
+                    "description": "Confidence score from 0.0 to 1.0",
+                    "type": "number"
+                }
+            },
+            "required": [
+                "sentiment",
+                "confidence"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "TeamData": {
+        "name": "TeamData",
+        "schema": {
+            "description": "TeamData",
+            "type": "object",
+            "properties": {
+                "name": {
+                    "description": "Team name",
+                    "type": "string"
+                },
+                "tags": {
+                    "description": "Tag list",
+                    "type": "array",
+                    "items": {
+                        "description": "Array item",
+                        "type": "string"
+                    }
+                },
+                "scores": {
+                    "description": "Score list",
+                    "type": "array",
+                    "items": {
+                        "description": "Array item",
+                        "type": "number"
+                    }
+                },
+                "members": {
+                    "description": "Team members",
+                    "type": "array",
+                    "items": {
+                        "description": "Array item",
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "description": "Full name",
+                                "type": "string"
+                            },
+                            "age": {
+                                "description": "Age in years",
+                                "type": "number"
+                            },
+                            "address": {
+                                "description": "Home address",
+                                "type": "object",
+                                "properties": {
+                                    "street": {
+                                        "description": "street",
+                                        "type": "string"
+                                    },
+                                    "city": {
+                                        "description": "city",
+                                        "type": "string"
+                                    }
+                                },
+                                "required": [
+                                    "street",
+                                    "city"
+                                ],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": [
+                            "name",
+                            "age",
+                            "address"
+                        ],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": [
+                "name",
+                "tags",
+                "scores",
+                "members"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "TypedSentimentData": {
+        "name": "TypedSentimentData",
+        "schema": {
+            "description": "TypedSentimentData",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "description": "The sentiment type",
+                    "enum": [
+                        "positive",
+                        "negative",
+                        "neutral"
+                    ],
+                    "type": "string"
+                },
+                "reason": {
+                    "description": "Optional explanation",
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                }
+            },
+            "required": [
+                "type",
+                "reason"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "ValidatedConfidenceData": {
+        "name": "ValidatedConfidenceData",
+        "schema": {
+            "description": "ValidatedConfidenceData",
+            "type": "object",
+            "properties": {
+                "confidence": {
+                    "description": "Confidence from 0 to 100",
+                    "type": "number"
+                }
+            },
+            "required": [
+                "confidence"
+            ],
+            "additionalProperties": false
+        }
+    }
+}

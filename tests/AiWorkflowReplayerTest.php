@@ -6,27 +6,18 @@ namespace AiWorkflow\Tests;
 
 use AiWorkflow\AiService;
 use AiWorkflow\AiWorkflowReplayer;
+use AiWorkflow\Gateway\LlmClient;
+use AiWorkflow\Gateway\ProviderFactory;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Models\AiWorkflowRequest;
 use AiWorkflow\PromptData;
 use AiWorkflow\PromptService;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Concerns\MakesTestFixtures;
-use Prism\Prism\Contracts\Schema;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Schema\AnyOfSchema;
-use Prism\Prism\Schema\ArraySchema;
-use Prism\Prism\Schema\BooleanSchema;
-use Prism\Prism\Schema\EnumSchema;
-use Prism\Prism\Schema\NumberSchema;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Schema\RawSchema;
-use Prism\Prism\Schema\StringSchema;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Testing\PrismFake;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\Text\Response;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Http;
 
 class AiWorkflowReplayerTest extends DatabaseTestCase
 {
@@ -34,95 +25,84 @@ class AiWorkflowReplayerTest extends DatabaseTestCase
 
     public function test_replay_text_request(): void
     {
-        // Record a request
-        Prism::fake([
-            TextResponseFake::make()->withText('Original response')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Original response'), OpenRouterFake::completion('Replayed response'));
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $recorded = AiWorkflowRequest::first();
         $this->assertNotNull($recorded);
 
-        // Replay it
-        Prism::fake([
-            TextResponseFake::make()->withText('Replayed response')->withFinishReason(FinishReason::Stop),
-        ]);
+        $result = app(AiWorkflowReplayer::class)->replay($recorded);
 
-        $replayer = app(AiWorkflowReplayer::class);
-        $result = $replayer->replay($recorded);
-
-        $this->assertInstanceOf(Response::class, $result);
+        $this->assertInstanceOf(TextResponse::class, $result);
         $this->assertSame('Replayed response', $result->text);
+
+        $bodies = OpenRouterFake::sentBodies();
+        $this->assertSame($bodies[0]['messages'], $bodies[1]['messages']);
+    }
+
+    public function test_replays_skip_the_executor_but_use_the_integration_key(): void
+    {
+        $recorded = $this->recordTextRequest();
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Replayed'));
+
+        app(AiWorkflowReplayer::class)->replay($recorded);
+
+        $this->assertDatabaseCount('integration_requests', 0);
+        Http::assertSent(fn (Request $request): bool => $request->hasHeader('Authorization', 'Bearer test-key'));
     }
 
     public function test_replay_structured_request(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'original'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'original']), OpenRouterFake::structured(['answer' => 'replayed']));
 
-        $service = app(AiService::class);
-        $service->sendStructuredMessages(
-            collect([new UserMessage('Hello')]),
-            $this->makePrompt(),
-            $this->makeSchema(),
-        );
+        app(AiService::class)->sendStructuredMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
 
         $recorded = AiWorkflowRequest::first();
         $this->assertNotNull($recorded);
         $this->assertSame('sendStructuredMessages', $recorded->method);
 
-        // Replay
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'replayed'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $replayer = app(AiWorkflowReplayer::class);
-        $result = $replayer->replay($recorded);
+        $result = app(AiWorkflowReplayer::class)->replay($recorded);
 
         $this->assertInstanceOf(StructuredResponse::class, $result);
         $this->assertSame(['answer' => 'replayed'], $result->structured);
+
+        $bodies = OpenRouterFake::sentBodies();
+        $this->assertSame($bodies[0]['response_format'], $bodies[1]['response_format']);
     }
 
     public function test_replay_with_model_override(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Original')->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
-
-        $recorded = AiWorkflowRequest::first();
-        $this->assertNotNull($recorded);
+        $recorded = $this->recordTextRequest();
         $this->assertSame('test-model', $recorded->model);
 
-        // Replay with different model (must be in provider:model format)
-        Prism::fake([
-            TextResponseFake::make()->withText('From new model')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('From new model'));
 
-        $fake = Prism::fake([
-            TextResponseFake::make()->withText('From new model')->withFinishReason(FinishReason::Stop),
-        ]);
+        $result = app(AiWorkflowReplayer::class)->replay($recorded, model: 'openrouter:different-model');
 
-        $replayer = app(AiWorkflowReplayer::class);
-        $result = $replayer->replay($recorded, model: 'anthropic:different-model');
-
-        $this->assertInstanceOf(Response::class, $result);
+        $this->assertInstanceOf(TextResponse::class, $result);
         $this->assertSame('From new model', $result->text);
+        $this->assertSame('different-model', OpenRouterFake::sentBodies()[0]['model']);
+    }
 
-        $fake->assertRequest(function (array $recorded): void {
-            $this->assertCount(1, $recorded);
-            $this->assertSame('different-model', $recorded[0]->model());
-            $this->assertSame('anthropic', $recorded[0]->provider());
-        });
+    public function test_replay_on_a_provider_outside_laravel_integrations(): void
+    {
+        $recorded = $this->recordTextRequest();
+        config()->set('ai.providers.anthropic.key', 'anthropic-key');
+        Http::fake(['api.anthropic.com/*' => Http::response([
+            'id' => 'msg_1',
+            'type' => 'message',
+            'role' => 'assistant',
+            'model' => 'claude-sonnet-5',
+            'content' => [['type' => 'text', 'text' => 'From Anthropic']],
+            'stop_reason' => 'end_turn',
+            'usage' => ['input_tokens' => 5, 'output_tokens' => 2],
+        ])]);
+
+        $result = app(AiWorkflowReplayer::class)->replay($recorded, model: 'anthropic:claude-sonnet-5');
+
+        $this->assertInstanceOf(TextResponse::class, $result);
+        $this->assertSame('From Anthropic', $result->text);
     }
 
     public function test_replay_applies_the_reasoning_setting_from_the_prompt(): void
@@ -138,17 +118,11 @@ class AiWorkflowReplayerTest extends DatabaseTestCase
             'duration_ms' => 100,
         ]);
 
-        $fake = Prism::fake([
-            TextResponseFake::make()->withText('Replayed')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Replayed'));
 
         app(AiWorkflowReplayer::class)->replay($recorded);
 
-        // Reasoning is carried in provider options, so a replay that omits them
-        // measures the model at its default effort, not the prompt's.
-        $fake->assertRequest(function (array $requests): void {
-            $this->assertSame(['effort' => 'high'], $requests[0]->providerOptions('reasoning'));
-        });
+        $this->assertSame(['effort' => 'high'], OpenRouterFake::sentBodies()[0]['reasoning']);
     }
 
     public function test_replay_applies_the_reasoning_setting_to_a_structured_request(): void
@@ -162,30 +136,16 @@ class AiWorkflowReplayerTest extends DatabaseTestCase
             'messages' => [['type' => 'user', 'content' => 'Hello']],
             'finish_reason' => 'stop',
             'duration_ms' => 100,
-            'schema' => [
-                'type' => 'object',
-                'name' => 'answer',
-                'description' => 'An answer',
-                'properties' => [
-                    'answer' => ['type' => 'string', 'description' => 'The answer'],
-                ],
-                'required' => ['answer'],
-            ],
+            'schema' => $this->makeSchema()->toArray(),
         ]);
 
-        $fake = Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'replayed'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'replayed']));
 
         app(AiWorkflowReplayer::class)->replay($recorded);
 
         // Eval runs go through replayStructured(), which builds its request
         // separately from replayText(), so the text test above covers none of it.
-        $fake->assertRequest(function (array $requests): void {
-            $this->assertSame(['effort' => 'high'], $requests[0]->providerOptions('reasoning'));
-        });
+        $this->assertSame(['effort' => 'high'], OpenRouterFake::sentBodies()[0]['reasoning']);
     }
 
     public function test_replay_falls_back_to_the_recorded_prompt_when_the_file_is_gone(): void
@@ -201,121 +161,91 @@ class AiWorkflowReplayerTest extends DatabaseTestCase
             'duration_ms' => 100,
         ]);
 
-        $fake = Prism::fake([
-            TextResponseFake::make()->withText('Replayed')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Replayed'));
 
         $result = app(AiWorkflowReplayer::class)->replay($recorded);
 
         $this->assertSame('Replayed', $result->text);
 
-        $fake->assertRequest(function (array $requests): void {
-            $this->assertSame('Recorded system prompt.', $requests[0]->systemPrompts()[0]->content);
-            $this->assertSame([], $requests[0]->providerOptions());
-        });
+        $body = OpenRouterFake::sentBodies()[0];
+        $this->assertSame(['role' => 'system', 'content' => 'Recorded system prompt.'], $body['messages'][0]);
+        $this->assertArrayNotHasKey('reasoning', $body);
     }
 
     public function test_replay_with_current_prompts(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Original')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Original'), OpenRouterFake::completion('From current prompt'));
 
         // Use test_prompt which exists in fixtures
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt('test_prompt', 'openrouter:old-model'));
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt('test_prompt', 'openrouter:old-model'));
 
         $recorded = AiWorkflowRequest::first();
         $this->assertNotNull($recorded);
         $this->assertSame('old-model', $recorded->model);
 
         // Replay with current prompts — should load test_prompt from fixtures
-        Prism::fake([
-            TextResponseFake::make()->withText('From current prompt')->withFinishReason(FinishReason::Stop),
-        ]);
+        $result = app(AiWorkflowReplayer::class)->replay($recorded, useCurrentPrompts: true);
 
-        $replayer = app(AiWorkflowReplayer::class);
-        $result = $replayer->replay($recorded, useCurrentPrompts: true);
-
-        $this->assertInstanceOf(Response::class, $result);
+        $this->assertInstanceOf(TextResponse::class, $result);
         $this->assertSame('From current prompt', $result->text);
+
+        $current = app(PromptService::class)->load('test_prompt');
+        $replayed = OpenRouterFake::sentBodies()[1];
+        $this->assertSame(PromptData::parseModelIdentifier($current->model)[1], $replayed['model']);
+        $this->assertSame(['role' => 'system', 'content' => $current->prompt], $replayed['messages'][0]);
     }
 
     public function test_replay_with_current_prompts_and_model_override(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Original')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Original'), OpenRouterFake::completion('Override model'));
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt('test_prompt', 'openrouter:old-model'));
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt('test_prompt', 'openrouter:old-model'));
 
         $recorded = AiWorkflowRequest::first();
         $this->assertNotNull($recorded);
 
-        // Replay: useCurrentPrompts loads prompt text from file, but model override wins
-        Prism::fake([
-            TextResponseFake::make()->withText('Override model')->withFinishReason(FinishReason::Stop),
-        ]);
+        $result = app(AiWorkflowReplayer::class)->replay($recorded, useCurrentPrompts: true, model: 'openrouter:override-model');
 
-        $replayer = app(AiWorkflowReplayer::class);
-        $result = $replayer->replay($recorded, useCurrentPrompts: true, model: 'anthropic:override-model');
-
-        $this->assertInstanceOf(Response::class, $result);
+        $this->assertInstanceOf(TextResponse::class, $result);
         $this->assertSame('Override model', $result->text);
+        $this->assertSame('override-model', OpenRouterFake::sentBodies()[1]['model']);
     }
 
     public function test_replay_across_models(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Original')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('Original'),
+            OpenRouterFake::completion('Model A response'),
+            OpenRouterFake::completion('Model B response'),
+            OpenRouterFake::completion('Model C response'),
+        );
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $recorded = AiWorkflowRequest::first();
         $this->assertNotNull($recorded);
 
-        // Replay across 3 models
-        $fake = Prism::fake([
-            TextResponseFake::make()->withText('Model A response')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Model B response')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Model C response')->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $replayer = app(AiWorkflowReplayer::class);
-        $results = $replayer->replayAcrossModels($recorded, [
+        $results = app(AiWorkflowReplayer::class)->replayAcrossModels($recorded, [
             'openrouter:model-a',
-            'anthropic:model-b',
-            'openai:model-c',
+            'openrouter:model-b',
+            'openrouter:model-c',
         ]);
 
         $this->assertCount(3, $results);
-        $this->assertArrayHasKey('openrouter:model-a', $results);
-        $this->assertArrayHasKey('anthropic:model-b', $results);
-        $this->assertArrayHasKey('openai:model-c', $results);
         $this->assertSame('Model A response', $results['openrouter:model-a']->text);
-        $this->assertSame('Model B response', $results['anthropic:model-b']->text);
-        $this->assertSame('Model C response', $results['openai:model-c']->text);
-
-        $fake->assertRequest(function (array $recorded): void {
-            $this->assertCount(3, $recorded);
-            $this->assertSame('model-a', $recorded[0]->model());
-            $this->assertSame('openrouter', $recorded[0]->provider());
-            $this->assertSame('model-b', $recorded[1]->model());
-            $this->assertSame('anthropic', $recorded[1]->provider());
-            $this->assertSame('model-c', $recorded[2]->model());
-            $this->assertSame('openai', $recorded[2]->provider());
-        });
+        $this->assertSame('Model B response', $results['openrouter:model-b']->text);
+        $this->assertSame('Model C response', $results['openrouter:model-c']->text);
+        $this->assertSame(['test-model', 'model-a', 'model-b', 'model-c'], array_column(OpenRouterFake::sentBodies(), 'model'));
     }
 
     public function test_replay_execution(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('First'),
+            OpenRouterFake::completion('Second'),
+            OpenRouterFake::completion('Replay 1'),
+            OpenRouterFake::completion('Replay 2'),
+        );
 
         $service = app(AiService::class);
         $service->startExecution('test_workflow');
@@ -326,59 +256,34 @@ class AiWorkflowReplayerTest extends DatabaseTestCase
         $this->assertNotNull($execution);
         $this->assertSame(2, $execution->requests()->count());
 
-        // Replay the entire execution
-        Prism::fake([
-            TextResponseFake::make()->withText('Replay 1')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Replay 2')->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $replayer = app(AiWorkflowReplayer::class);
-        $results = $replayer->replayExecution($execution);
+        $results = app(AiWorkflowReplayer::class)->replayExecution($execution);
 
         $this->assertCount(2, $results);
         $this->assertSame('Replay 1', $results[0]->text);
         $this->assertSame('Replay 2', $results[1]->text);
     }
 
-    // --- Schema reconstruction ---
+    // --- Recorded schemas ---
 
-    public function test_replay_structured_rebuilds_the_recorded_schema_from_the_same_prism_classes(): void
+    public function test_replay_structured_sends_the_recorded_schema_unchanged(): void
     {
-        $schema = $this->makeReplayableSchema();
+        $schema = $this->ticketTriageSchema();
 
-        $fake = $this->replayStructuredWithSchema($schema->toArray(), $schema->name());
+        $sent = $this->replayStructuredWithSchema($schema, 'TicketTriage');
 
-        $fake->assertRequest(function (array $requests) use ($schema): void {
-            $this->assertEquals($schema, $requests[0]->schema());
-        });
+        $this->assertSame(['name' => 'TicketTriage', 'strict' => true, 'schema' => $schema], $sent);
     }
 
     public function test_replay_structured_falls_back_to_the_name_schema_when_the_row_has_no_schema_name(): void
     {
-        $fake = $this->replayStructuredWithSchema($this->makeReplayableSchema()->toArray());
+        $sent = $this->replayStructuredWithSchema($this->ticketTriageSchema());
 
-        $fake->assertRequest(function (array $requests): void {
-            $this->assertSame('schema', $requests[0]->schema()->name());
-        });
-    }
-
-    public function test_replay_structured_rebuilds_the_schema_when_the_database_reorders_its_keys(): void
-    {
-        $recorded = $this->reverseKeysRecursively($this->makeReplayableSchema()->toArray());
-
-        $fake = $this->replayStructuredWithSchema($recorded);
-
-        $fake->assertRequest(function (array $requests) use ($recorded): void {
-            $sent = $requests[0]->schema();
-
-            $this->assertEquals($recorded, $sent->toArray());
-            $this->assertNotContains(RawSchema::class, $this->schemaClasses($sent));
-        });
+        $this->assertSame('schema', $sent['name']);
     }
 
     public function test_replay_structured_restores_property_order_from_required_where_the_database_sorts_keys(): void
     {
-        $this->app->instance(AiWorkflowReplayer::class, new class(app(PromptService::class)) extends AiWorkflowReplayer
+        $this->app->instance(AiWorkflowReplayer::class, new class(app(PromptService::class), app(LlmClient::class), app(ProviderFactory::class)) extends AiWorkflowReplayer
         {
             protected function restoresPropertyOrder(AiWorkflowRequest $request): bool
             {
@@ -386,147 +291,120 @@ class AiWorkflowReplayerTest extends DatabaseTestCase
             }
         });
 
-        $schema = $this->makeReplayableSchema();
+        $schema = $this->ticketTriageSchema();
 
-        $fake = $this->replayStructuredWithSchema($this->reverseKeysRecursively($schema->toArray()), $schema->name());
+        $sent = $this->replayStructuredWithSchema($this->sortKeysRecursively($schema), 'TicketTriage');
 
-        $fake->assertRequest(function (array $requests) use ($schema): void {
-            $this->assertEquals($schema, $requests[0]->schema());
-        });
+        $this->assertIsArray($sent['schema']);
+        $this->assertIsArray($sent['schema']['properties']);
+        $this->assertSame(array_keys($schema['properties']), array_keys($sent['schema']['properties']));
+        $this->assertIsArray($sent['schema']['properties']['actions']);
+        $this->assertSame(['summary', 'due_in_days'], array_keys($sent['schema']['properties']['actions']['items']['properties']));
     }
 
-    public function test_replay_structured_sends_an_any_of_with_an_untyped_option_as_recorded(): void
+    public function test_replay_structured_keeps_the_stored_order_elsewhere(): void
     {
-        $recorded = [
-            'description' => 'Statistics',
-            'type' => 'object',
-            'properties' => [
-                'value' => ['anyOf' => [['description' => 'Anything']], 'description' => 'A value'],
-            ],
-            'required' => ['value'],
-            'additionalProperties' => false,
-        ];
+        $sorted = $this->sortKeysRecursively($this->ticketTriageSchema());
 
-        $fake = $this->replayStructuredWithSchema($recorded);
+        $sent = $this->replayStructuredWithSchema($sorted);
 
-        $fake->assertRequest(function (array $requests) use ($recorded): void {
-            $sent = $requests[0]->schema();
-
-            $this->assertInstanceOf(ObjectSchema::class, $sent);
-            $this->assertInstanceOf(RawSchema::class, $sent->properties[0]);
-            $this->assertSame($recorded, $sent->toArray());
-        });
+        $this->assertSame($sorted, $sent['schema']);
     }
 
-    public function test_replay_structured_sends_nodes_it_cannot_rebuild_exactly_as_recorded(): void
+    public function test_replay_structured_without_a_recorded_schema_asks_for_a_single_result(): void
     {
-        $recorded = [
-            'description' => 'Statistics',
-            'type' => 'object',
-            'properties' => [
-                'count' => ['type' => 'integer', 'description' => 'Count', 'minimum' => 0],
-                'tags' => ['type' => 'array', 'description' => 'Tags'],
-                'label' => ['type' => 'string', 'description' => 'Label', 'minLength' => 3],
-                'ratio' => ['description' => 'Ratio', 'type' => 'number'],
-            ],
-            'required' => ['count', 'tags', 'label', 'ratio'],
-            'additionalProperties' => false,
-        ];
+        $sent = $this->replayStructuredWithSchema(null);
 
-        $fake = $this->replayStructuredWithSchema($recorded);
-
-        $fake->assertRequest(function (array $requests) use ($recorded): void {
-            $sent = $requests[0]->schema();
-
-            $this->assertInstanceOf(ObjectSchema::class, $sent);
-            $this->assertSame($recorded, $sent->toArray());
-            $this->assertInstanceOf(RawSchema::class, $sent->properties[0]);
-            $this->assertInstanceOf(RawSchema::class, $sent->properties[1]);
-            $this->assertInstanceOf(RawSchema::class, $sent->properties[2]);
-            $this->assertInstanceOf(NumberSchema::class, $sent->properties[3]);
-        });
+        $this->assertSame('replay', $sent['name']);
+        $this->assertIsArray($sent['schema']);
+        $this->assertSame(['result'], $sent['schema']['required']);
     }
 
     // --- Template variables for faithful replay ---
 
     public function test_replay_with_current_prompts_uses_stored_template_variables(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Original')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Original'), OpenRouterFake::completion('Replayed with vars'));
 
-        $service = app(AiService::class);
         $prompt = new PromptData(
             id: 'template_prompt',
             model: 'openrouter:old-model',
             prompt: 'You are helping Jane with their Premium subscription.',
             variables: ['customer_name' => 'Jane', 'product' => 'Premium'],
         );
-        $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $prompt);
 
         $recorded = AiWorkflowRequest::first();
         $this->assertNotNull($recorded);
         $this->assertSame(['customer_name' => 'Jane', 'product' => 'Premium'], $recorded->template_variables);
 
         // Replay with current prompts — should re-render the template with stored variables
-        Prism::fake([
-            TextResponseFake::make()->withText('Replayed with vars')->withFinishReason(FinishReason::Stop),
-        ]);
+        $result = app(AiWorkflowReplayer::class)->replay($recorded, useCurrentPrompts: true);
 
-        $replayer = app(AiWorkflowReplayer::class);
-        $result = $replayer->replay($recorded, useCurrentPrompts: true);
-
-        $this->assertInstanceOf(Response::class, $result);
+        $this->assertInstanceOf(TextResponse::class, $result);
         $this->assertSame('Replayed with vars', $result->text);
+
+        $systemPrompt = OpenRouterFake::sentBodies()[1]['messages'][0]['content'];
+        $this->assertIsString($systemPrompt);
+        $this->assertStringContainsString('Jane', $systemPrompt);
     }
 
-    private function makeReplayableSchema(): ObjectSchema
+    private function recordTextRequest(): AiWorkflowRequest
     {
-        return new ObjectSchema(
-            name: 'TicketTriage',
-            description: 'A support ticket triage',
-            properties: [
-                new EnumSchema('priority', 'How urgent the ticket is', ['low', 'medium', 'high'], nullable: true),
-                new NumberSchema('confidence', 'Confidence in the triage', nullable: true, maximum: 1.0, minimum: 0.0),
-                new BooleanSchema('needs_human', 'Whether a person must reply'),
-                new StringSchema('reference', 'Order reference', nullable: true, pattern: '^[A-Z]{3}-\d+$'),
-                new ArraySchema('tags', 'Tags that apply', new StringSchema('item', 'A tag'), minItems: 1, maxItems: 5),
-                new ArraySchema('actions', 'Follow-up actions', new ObjectSchema(
-                    name: 'item',
-                    description: 'A follow-up action',
-                    properties: [
-                        new StringSchema('summary', 'What to do'),
-                        new NumberSchema('due_in_days', 'Days until it is due', nullable: true),
-                    ],
-                    requiredFields: ['summary', 'due_in_days'],
-                )),
-                new ObjectSchema(
-                    name: 'customer',
-                    description: 'The customer, when known',
-                    properties: [
-                        new StringSchema('email', 'Email address', format: 'email'),
-                    ],
-                    requiredFields: ['email'],
-                    nullable: true,
-                ),
-                new AnyOfSchema(
-                    schemas: [
-                        new StringSchema('item', 'A queue name'),
-                        new NumberSchema('item', 'An agent ID', minimum: 1.0),
-                    ],
-                    name: 'assignee',
-                    description: 'Who should pick it up',
-                    nullable: true,
-                ),
-            ],
-            requiredFields: ['priority', 'confidence', 'needs_human', 'reference', 'tags', 'actions', 'customer', 'assignee'],
-        );
+        return AiWorkflowRequest::create([
+            'prompt_id' => 'test',
+            'method' => 'sendMessages',
+            'provider' => 'openrouter',
+            'model' => 'test-model',
+            'system_prompt' => 'You are a helpful assistant.',
+            'messages' => [['type' => 'user', 'content' => 'Hello']],
+            'finish_reason' => 'stop',
+            'duration_ms' => 100,
+        ]);
     }
 
     /**
-     * @param  array<string, mixed>  $schema
+     * @return array<string, mixed>
      */
-    private function replayStructuredWithSchema(array $schema, ?string $schemaName = null): PrismFake
+    private function ticketTriageSchema(): array
+    {
+        return [
+            'description' => 'A support ticket triage',
+            'type' => 'object',
+            'properties' => [
+                'priority' => ['description' => 'How urgent the ticket is', 'enum' => ['low', 'medium', 'high'], 'type' => ['string', 'null']],
+                'confidence' => ['description' => 'Confidence in the triage', 'type' => ['number', 'null'], 'maximum' => 1, 'minimum' => 0],
+                'needs_human' => ['description' => 'Whether a person must reply', 'type' => 'boolean'],
+                'tags' => ['description' => 'Tags that apply', 'type' => 'array', 'items' => ['description' => 'A tag', 'type' => 'string'], 'minItems' => 1],
+                'actions' => [
+                    'description' => 'Follow-up actions',
+                    'type' => 'array',
+                    'items' => [
+                        'description' => 'A follow-up action',
+                        'type' => 'object',
+                        'properties' => [
+                            'summary' => ['description' => 'What to do', 'type' => 'string'],
+                            'due_in_days' => ['description' => 'Days until it is due', 'type' => ['number', 'null']],
+                        ],
+                        'required' => ['summary', 'due_in_days'],
+                        'additionalProperties' => false,
+                    ],
+                ],
+                'assignee' => ['anyOf' => [['description' => 'A queue name', 'type' => 'string'], ['type' => 'null']], 'description' => 'Who should pick it up'],
+            ],
+            'required' => ['priority', 'confidence', 'needs_human', 'tags', 'actions', 'assignee'],
+            'additionalProperties' => false,
+        ];
+    }
+
+    /**
+     * Replay a structured request recorded with the given schema and return
+     * the json_schema block that was sent to OpenRouter.
+     *
+     * @param  array<string, mixed>|null  $schema
+     * @return array<array-key, mixed>
+     */
+    private function replayStructuredWithSchema(?array $schema, ?string $schemaName = null): array
     {
         $request = AiWorkflowRequest::create([
             'prompt_id' => 'test',
@@ -541,37 +419,28 @@ class AiWorkflowReplayerTest extends DatabaseTestCase
             'schema_name' => $schemaName,
         ]);
 
-        $fake = Prism::fake([
-            StructuredResponseFake::make()->withStructured([])->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured([]));
 
         app(AiWorkflowReplayer::class)->replay($request->refresh());
 
-        return $fake;
+        $sent = OpenRouterFake::sentBodies()[0]['response_format']['json_schema'];
+        $this->assertIsArray($sent);
+
+        return $sent;
     }
 
-    private function reverseKeysRecursively(mixed $value): mixed
+    private function sortKeysRecursively(mixed $value): mixed
     {
         if (! is_array($value)) {
             return $value;
         }
 
-        $reversed = array_map(fn (mixed $entry): mixed => $this->reverseKeysRecursively($entry), $value);
+        $sorted = array_map(fn (mixed $entry): mixed => $this->sortKeysRecursively($entry), $value);
 
-        return array_is_list($reversed) ? $reversed : array_reverse($reversed, true);
-    }
+        if (! array_is_list($sorted)) {
+            ksort($sorted);
+        }
 
-    /**
-     * @return list<class-string<Schema>>
-     */
-    private function schemaClasses(Schema $schema): array
-    {
-        $children = match (true) {
-            $schema instanceof ObjectSchema => $schema->properties,
-            $schema instanceof ArraySchema => [$schema->items],
-            default => [],
-        };
-
-        return array_merge([$schema::class], ...array_map($this->schemaClasses(...), array_values($children)));
+        return $sorted;
     }
 }

@@ -20,14 +20,22 @@ reviews:
     path_instructions:
         - path: "src/**"
           instructions: >
-              This is a Laravel package (pocketarc/ai-workflow) that wraps Prism PHP
-              with production-ready resilience: retry logic with jitter, fallback
-              models, YAML-based prompt management with Mustache templating, request
-              logging with tagging, a replay engine, eval framework, middleware
-              pipeline, caching, multimodal support, and Laravel Data integration.
-              PHP 8.2+, Laravel 11/12/13. PHPStan level 10 with strict rules. Uses
-              proper runtime type validation rather than @var annotations or casts
-              on mixed. Model identifiers use `provider:model` format.
+              This is a Laravel package (pocketarc/ai-workflow) built on the Laravel
+              AI SDK (laravel/ai). Its public API uses the package's own message,
+              response, tool, schema and exception types, and no laravel/ai types.
+              The package runs its own tool loop on laravel/ai's gateways and sends
+              OpenRouter calls through pocketarc/laravel-integrations, which
+              provides the circuit breaker, retries and rate limiting. The package
+              also has fallback models, YAML-based prompt management with Mustache
+              templating, request logging with tagging, a replay engine, an eval
+              framework, a middleware pipeline, caching, multimodal support, and
+              Laravel Data integration. It requires PHP 8.3+ and Laravel 12.62+ or
+              13.15+. PHPStan runs at level 10 with strict rules. The code narrows
+              mixed values with runtime checks such as is_string() and is_array(),
+              not with @var annotations or casts. Model identifiers are in
+              `provider:model` format. The stored message JSON, schemas and cache
+              keys must stay byte-identical to 6.x, and
+              tests/UpgradeCompatibilityTest.php checks this.
     tools:
         gitleaks:
             enabled: true

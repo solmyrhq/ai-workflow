@@ -9,6 +9,10 @@ use AiWorkflow\Enums\GuardrailDirection;
 use AiWorkflow\Events\AiWorkflowRequestCompleted;
 use AiWorkflow\Events\AiWorkflowRequestFailed;
 use AiWorkflow\Exceptions\GuardrailViolationException;
+use AiWorkflow\Exceptions\ProviderRequestException;
+use AiWorkflow\Exceptions\StructuredDecodingException;
+use AiWorkflow\Exceptions\UnexpectedFinishReasonException;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Middleware\AiWorkflowContext;
 use AiWorkflow\Middleware\AiWorkflowMiddleware;
 use AiWorkflow\Middleware\InputGuardrail;
@@ -16,6 +20,8 @@ use AiWorkflow\Middleware\OutputGuardrail;
 use AiWorkflow\Models\AiWorkflowExecution;
 use AiWorkflow\Models\AiWorkflowRequest;
 use AiWorkflow\PromptData;
+use AiWorkflow\Responses\Usage;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Concerns\MakesTestFixtures;
 use Closure;
 use GuzzleHttp\Psr7\Response;
@@ -23,15 +29,6 @@ use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response as HttpClientResponse;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Event;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Exceptions\PrismException;
-use Prism\Prism\Exceptions\PrismStructuredDecodingException;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
-use Prism\Prism\ValueObjects\Usage;
 use ReflectionMethod;
 use RuntimeException;
 
@@ -41,14 +38,9 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_request_is_logged_when_enabled(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello from AI')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello from AI'));
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $this->assertDatabaseCount('ai_workflow_requests', 1);
 
@@ -69,24 +61,16 @@ class AiServiceLoggingTest extends DatabaseTestCase
     {
         config()->set('ai-workflow.logging.enabled', false);
 
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $this->assertDatabaseCount('ai_workflow_requests', 0);
     }
 
     public function test_execution_groups_requests(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('First'), OpenRouterFake::completion('Second'));
 
         $service = app(AiService::class);
         $service->startExecution('test_workflow', ['ticket_id' => 42]);
@@ -111,17 +95,11 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_failed_request_is_logged_with_error(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Bad response')
-                ->withFinishReason(FinishReason::Unknown)
-                ->withUsage(new Usage(70, 10)),
-        ]);
-
-        $service = app(AiService::class);
+        config()->set('ai-workflow.retry.times', 1);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Bad response', 'weird', OpenRouterFake::tokens(70, 10)));
 
         try {
-            $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+            app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
         } catch (\Throwable) {
             // Expected — finish reason Unknown throws.
         }
@@ -132,21 +110,32 @@ class AiServiceLoggingTest extends DatabaseTestCase
         $this->assertNotNull($request);
         $this->assertNotNull($request->error);
         $this->assertStringContainsString('Unexpected AI finish reason', $request->error);
-        $this->assertSame(PrismException::class, $request->error_class);
+        $this->assertSame(UnexpectedFinishReasonException::class, $request->error_class);
         $this->assertNull($request->http_status);
-        $this->assertNull($request->response_body);
+        $this->assertIsString($request->response_body);
+        $this->assertStringContainsString('"finish_reason":"weird"', $request->response_body);
         $this->assertSame(70, $request->input_tokens);
         $this->assertSame(10, $request->output_tokens);
     }
 
+    public function test_a_failed_http_request_is_logged_with_its_status_and_body(): void
+    {
+        OpenRouterFake::respondWith(OpenRouterFake::error(400, 'Invalid model'));
+
+        try {
+            app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        } catch (ProviderRequestException) {
+        }
+
+        $request = AiWorkflowRequest::query()->sole();
+        $this->assertSame(400, $request->http_status);
+        $this->assertSame('{"error":{"code":400,"message":"Invalid model"}}', $request->response_body);
+        $this->assertSame(ProviderRequestException::class, $request->error_class);
+    }
+
     public function test_a_structured_request_logs_its_cache_tokens(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'cached'])
-                ->withUsage(new Usage(1200, 40, cacheWriteInputTokens: 150, cacheReadInputTokens: 1000))
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'cached'], OpenRouterFake::tokens(1200, 40, cacheRead: 1000, cacheWrite: 150)));
 
         app(AiService::class)->sendStructuredMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
 
@@ -158,34 +147,23 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_a_structured_answer_holding_a_non_finite_number_is_logged_as_a_decoding_failure(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withText('{"answer":1e999}')
-                ->withStructured(['answer' => INF])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
-
-        $service = app(AiService::class);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('{"answer":1e999}'));
 
         try {
-            $service->sendStructuredMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
+            app(AiService::class)->sendStructuredMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
             $this->fail('Expected a structured decoding failure.');
-        } catch (PrismStructuredDecodingException) {
+        } catch (StructuredDecodingException) {
         }
 
         $request = AiWorkflowRequest::first();
         $this->assertNotNull($request);
         $this->assertNull($request->structured_response);
-        $this->assertSame(PrismStructuredDecodingException::class, $request->error_class);
+        $this->assertSame(StructuredDecodingException::class, $request->error_class);
     }
 
-    public function test_extract_http_details_reads_prism_exception_fields(): void
+    public function test_extract_http_details_reads_provider_exception_fields(): void
     {
-        $exception = PrismException::providerResponseError(
-            'OpenRouter Bad Request: Provider returned error',
-            httpStatus: 400,
-            responseBody: '{"error":{"message":"bad"}}',
-        );
+        $exception = new ProviderRequestException('Bad request', 'openrouter', 400, '{"error":{"message":"bad"}}');
 
         $details = $this->invokeExtractHttpDetails($exception);
 
@@ -195,10 +173,8 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_extract_http_details_walks_chain_for_request_exception(): void
     {
-        $psrResponse = new Response(400, [], '{"error":"bad"}');
-        $httpResponse = new HttpClientResponse($psrResponse);
-        $requestException = new RequestException($httpResponse);
-        $wrapper = PrismException::providerRequestError('openrouter:test-model', $requestException);
+        $requestException = new RequestException(new HttpClientResponse(new Response(400, [], '{"error":"bad"}')));
+        $wrapper = new RuntimeException('Request failed', previous: $requestException);
 
         $details = $this->invokeExtractHttpDetails($wrapper);
 
@@ -264,26 +240,15 @@ class AiServiceLoggingTest extends DatabaseTestCase
         $service = app(AiService::class);
         $service->startExecution('noop_workflow');
 
-        $execution = $service->endExecution();
-
-        $this->assertNull($execution);
+        $this->assertNull($service->endExecution());
         $this->assertDatabaseCount('ai_workflow_executions', 0);
     }
 
     public function test_structured_request_is_logged_with_schema(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'test'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'test']));
 
-        $service = app(AiService::class);
-        $service->sendStructuredMessages(
-            collect([new UserMessage('Hello')]),
-            $this->makePrompt(),
-            $this->makeSchema(),
-        );
+        app(AiService::class)->sendStructuredMessages(collect([new UserMessage('Hello')]), $this->makePrompt(), $this->makeSchema());
 
         $this->assertDatabaseCount('ai_workflow_requests', 1);
 
@@ -291,19 +256,13 @@ class AiServiceLoggingTest extends DatabaseTestCase
         $this->assertNotNull($request);
         $this->assertSame('sendStructuredMessages', $request->method);
         $this->assertSame(['answer' => 'test'], $request->structured_response);
-        $this->assertNotNull($request->schema);
-        $this->assertIsArray($request->schema);
+        $this->assertSame($this->makeSchema()->toArray(), $request->schema);
         $this->assertSame('test', $request->schema_name);
     }
 
     public function test_response_rejected_by_an_output_guardrail_is_logged_with_its_tokens(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Bad content')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(80, 20, thoughtTokens: 5)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Bad content', usage: OpenRouterFake::tokens(80, 20, reasoning: 5)));
 
         $service = app(AiService::class);
         $service->addMiddleware(new class extends OutputGuardrail
@@ -333,12 +292,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_rejected_response_usage_is_added_to_usage_the_exception_already_carries(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Bad content')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(80, 20)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Bad content', usage: OpenRouterFake::tokens(80, 20)));
 
         $service = app(AiService::class);
         $service->addMiddleware(new class extends OutputGuardrail
@@ -362,12 +316,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_structured_failure_is_logged_with_the_input_middleware_sent(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'leaked'])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(80, 20)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'leaked'], OpenRouterFake::tokens(80, 20)));
 
         $service = app(AiService::class);
         $service->addMiddleware(new class implements AiWorkflowMiddleware
@@ -399,19 +348,19 @@ class AiServiceLoggingTest extends DatabaseTestCase
         $this->assertSame([['type' => 'user', 'content' => '[redacted]']], $request->messages);
         $this->assertSame(['answer' => 'leaked'], $request->structured_response);
         $this->assertSame(80, $request->input_tokens);
+
+        $this->assertSame([
+            ['role' => 'system', 'content' => 'Redacted system prompt.'],
+            ['role' => 'user', 'content' => '[redacted]'],
+        ], OpenRouterFake::sentBodies()[0]['messages']);
     }
 
     public function test_structured_fallback_runs_through_middleware_and_logs_both_requests(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => ['likelihood' => INF]])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'from fallback'])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(90, 30)),
-        ]);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('{"answer":{"likelihood":1e999}}'),
+            OpenRouterFake::structured(['answer' => 'from fallback'], OpenRouterFake::tokens(90, 30)),
+        );
 
         $middleware = new class implements AiWorkflowMiddleware
         {
@@ -443,7 +392,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
         $requests = AiWorkflowRequest::query()->orderBy('id')->get();
         $this->assertCount(2, $requests);
         $this->assertSame('test-model', $requests[0]->model);
-        $this->assertSame(PrismStructuredDecodingException::class, $requests[0]->error_class);
+        $this->assertSame(StructuredDecodingException::class, $requests[0]->error_class);
         $this->assertSame('fallback-model', $requests[1]->model);
         $this->assertNull($requests[1]->error);
         $this->assertSame([['type' => 'user', 'content' => '[redacted]']], $requests[1]->messages);
@@ -452,44 +401,33 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_structured_step_with_tools_logs_a_response_rejected_for_its_finish_reason(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('The answer is 42')
-                ->withMessages(collect([new AssistantMessage('The answer is 42')]))
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => '42'])
-                ->withFinishReason(FinishReason::Unknown)
-                ->withUsage(new Usage(90, 30)),
-        ]);
+        config()->set('ai-workflow.retry.times', 1);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('The answer is 42'),
+            OpenRouterFake::completion('{"answer":"42"}', 'weird', OpenRouterFake::tokens(90, 30)),
+        );
 
         try {
             app(AiService::class)->sendStructuredMessagesWithTools(collect([new UserMessage('What is the answer?')]), $this->makePrompt(), $this->makeSchema());
-            $this->fail('Expected PrismException');
-        } catch (PrismException) {
+            $this->fail('Expected UnexpectedFinishReasonException');
+        } catch (UnexpectedFinishReasonException) {
         }
 
         $request = AiWorkflowRequest::query()->where('method', 'sendStructuredMessagesWithTools')->sole();
-        $this->assertNotNull($request->error);
-        $this->assertSame(['answer' => '42'], $request->structured_response);
+        $this->assertSame(UnexpectedFinishReasonException::class, $request->error_class);
+        $this->assertIsString($request->response_body);
+        $this->assertStringContainsString('{\"answer\":\"42\"}', $request->response_body);
         $this->assertSame(90, $request->input_tokens);
     }
 
     public function test_structured_step_with_tools_logs_a_failed_fallback(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('The answer is 42')
-                ->withMessages(collect([new AssistantMessage('The answer is 42')]))
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => ['likelihood' => INF]])
-                ->withFinishReason(FinishReason::Stop),
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => '42'])
-                ->withFinishReason(FinishReason::Unknown)
-                ->withUsage(new Usage(90, 30)),
-        ]);
+        config()->set('ai-workflow.retry.times', 1);
+        OpenRouterFake::respondWith(
+            OpenRouterFake::completion('The answer is 42'),
+            OpenRouterFake::completion('{"answer":{"likelihood":1e999}}'),
+            OpenRouterFake::completion('{"answer":"42"}', 'weird', OpenRouterFake::tokens(90, 30)),
+        );
 
         try {
             app(AiService::class)->sendStructuredMessagesWithTools(
@@ -497,14 +435,13 @@ class AiServiceLoggingTest extends DatabaseTestCase
                 $this->makePrompt(fallbackModel: 'openrouter:fallback-model'),
                 $this->makeSchema(),
             );
-            $this->fail('Expected PrismException');
-        } catch (PrismException $e) {
-            $this->assertNotInstanceOf(PrismStructuredDecodingException::class, $e);
+            $this->fail('Expected UnexpectedFinishReasonException');
+        } catch (UnexpectedFinishReasonException) {
         }
 
         $requests = AiWorkflowRequest::query()->where('method', 'sendStructuredMessagesWithTools')->orderBy('id')->get();
         $this->assertCount(2, $requests);
-        $this->assertSame(PrismStructuredDecodingException::class, $requests[0]->error_class);
+        $this->assertSame(StructuredDecodingException::class, $requests[0]->error_class);
         $this->assertSame('fallback-model', $requests[1]->model);
         $this->assertNotNull($requests[1]->error);
         $this->assertSame(90, $requests[1]->input_tokens);
@@ -512,12 +449,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_a_throwing_completed_listener_does_not_log_a_failed_text_request(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Fine')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(80, 20)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Fine', usage: OpenRouterFake::tokens(80, 20)));
 
         $failedEvents = $this->throwFromCompletedListener();
 
@@ -536,12 +468,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_a_throwing_completed_listener_does_not_log_a_failed_structured_request(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'test'])
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(80, 20)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'test'], OpenRouterFake::tokens(80, 20)));
 
         $failedEvents = $this->throwFromCompletedListener();
 
@@ -560,12 +487,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_a_throwing_completed_listener_does_not_log_a_failed_stream(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Fine')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(80, 20)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::textStream(['Fine'], usage: OpenRouterFake::tokens(80, 20)));
 
         $failedEvents = $this->throwFromCompletedListener();
 
@@ -628,13 +550,10 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_execution_token_tracking(): void
     {
-        $usage = new Usage(100, 50);
-
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop)->withUsage($usage),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop)->withUsage($usage),
-            TextResponseFake::make()->withText('Third')->withFinishReason(FinishReason::Stop)->withUsage($usage),
-        ]);
+        OpenRouterFake::respondWith(...array_map(
+            fn (string $text) => OpenRouterFake::completion($text, usage: OpenRouterFake::tokens(100, 50)),
+            ['First', 'Second', 'Third'],
+        ));
 
         $service = app(AiService::class);
         $service->startExecution('token_test');
@@ -669,9 +588,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_prompt_tags_are_stored(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Hello')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
         $prompt = new PromptData(
             id: 'test',
@@ -680,8 +597,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
             tags: ['classification', 'intent'],
         );
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $prompt);
 
         $request = AiWorkflowRequest::first();
         $this->assertNotNull($request);
@@ -690,9 +606,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_service_tags_are_stored(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Hello')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
         $service = app(AiService::class);
         $service->setTags(['billing', 'urgent']);
@@ -705,9 +619,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_prompt_and_service_tags_are_merged(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Hello')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
         $prompt = new PromptData(
             id: 'test',
@@ -727,12 +639,9 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_tags_null_when_none_set(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Hello')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $request = AiWorkflowRequest::first();
         $this->assertNotNull($request);
@@ -741,10 +650,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_with_tag_scope_filters_correctly(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('First'), OpenRouterFake::completion('Second'));
 
         $service = app(AiService::class);
 
@@ -761,11 +667,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_with_any_tag_scope_filters_correctly(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop),
-            TextResponseFake::make()->withText('Third')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('First'), OpenRouterFake::completion('Second'), OpenRouterFake::completion('Third'));
 
         $service = app(AiService::class);
 
@@ -783,16 +685,9 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_stream_request_is_logged(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Streamed')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(80, 40)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::textStream(['Streamed'], usage: OpenRouterFake::tokens(80, 40)));
 
-        $service = app(AiService::class);
-
-        foreach ($service->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()) as $event) {
+        foreach (app(AiService::class)->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()) as $event) {
             // Consume.
         }
 
@@ -821,9 +716,7 @@ class AiServiceLoggingTest extends DatabaseTestCase
             cacheTtl: 3600,
         );
 
-        Prism::fake([
-            TextResponseFake::make()->withText('Cached response')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Cached response'));
 
         $service = app(AiService::class);
 
@@ -837,15 +730,9 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_thought_tokens_are_logged(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50, thoughtTokens: 25)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello', usage: OpenRouterFake::tokens(100, 50, reasoning: 25)));
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $request = AiWorkflowRequest::first();
         $this->assertNotNull($request);
@@ -856,15 +743,9 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_thought_tokens_null_when_not_present(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withFinishReason(FinishReason::Stop)
-                ->withUsage(new Usage(100, 50)),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello', usage: OpenRouterFake::tokens(100, 50)));
 
-        $service = app(AiService::class);
-        $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
 
         $request = AiWorkflowRequest::first();
         $this->assertNotNull($request);
@@ -873,13 +754,10 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_execution_thought_token_tracking(): void
     {
-        $usage = new Usage(100, 50, thoughtTokens: 25);
-
-        Prism::fake([
-            TextResponseFake::make()->withText('First')->withFinishReason(FinishReason::Stop)->withUsage($usage),
-            TextResponseFake::make()->withText('Second')->withFinishReason(FinishReason::Stop)->withUsage($usage),
-            TextResponseFake::make()->withText('Third')->withFinishReason(FinishReason::Stop)->withUsage($usage),
-        ]);
+        OpenRouterFake::respondWith(...array_map(
+            fn (string $text) => OpenRouterFake::completion($text, usage: OpenRouterFake::tokens(100, 50, reasoning: 25)),
+            ['First', 'Second', 'Third'],
+        ));
 
         $service = app(AiService::class);
         $service->startExecution('thought_token_test');
@@ -897,23 +775,12 @@ class AiServiceLoggingTest extends DatabaseTestCase
 
     public function test_messages_are_serialized_correctly(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Response')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Response'));
 
-        $service = app(AiService::class);
-        $service->sendMessages(
-            collect([new UserMessage('Hello world')]),
-            $this->makePrompt(),
-        );
+        app(AiService::class)->sendMessages(collect([new UserMessage('Hello world')]), $this->makePrompt());
 
         $request = AiWorkflowRequest::first();
         $this->assertNotNull($request);
-        $this->assertIsArray($request->messages);
-        $this->assertCount(1, $request->messages);
-        $this->assertSame('user', $request->messages[0]['type']);
-        $this->assertSame('Hello world', $request->messages[0]['content']);
+        $this->assertSame([['type' => 'user', 'content' => 'Hello world']], $request->messages);
     }
 }

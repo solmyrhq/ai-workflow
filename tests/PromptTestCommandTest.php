@@ -4,10 +4,7 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Tests;
 
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\Testing\TextResponseFake;
+use AiWorkflow\Testing\OpenRouterFake;
 use Symfony\Component\Yaml\Yaml;
 
 class PromptTestCommandTest extends TestCase
@@ -29,11 +26,7 @@ class PromptTestCommandTest extends TestCase
 
     public function test_runs_single_prompt_test(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello! How can I help you?')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello! How can I help you?'));
 
         $this->artisan('ai-workflow:prompt-test', ['prompt' => 'test_prompt'])
             ->expectsOutputToContain('PASS: Basic text response')
@@ -43,11 +36,7 @@ class PromptTestCommandTest extends TestCase
 
     public function test_contains_assertion_fails_when_missing(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Goodbye cruel world')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Goodbye cruel world'));
 
         $this->artisan('ai-workflow:prompt-test', ['prompt' => 'test_prompt'])
             ->expectsOutputToContain('FAIL: Basic text response')
@@ -57,16 +46,12 @@ class PromptTestCommandTest extends TestCase
 
     public function test_runs_all_prompt_tests(): void
     {
-        Prism::fake([
+        OpenRouterFake::respondWith(
             // template_prompt (alphabetically first)
-            TextResponseFake::make()
-                ->withText('Hi Jane Doe, welcome to your Pro Plan support.')
-                ->withFinishReason(FinishReason::Stop),
+            OpenRouterFake::completion('Hi Jane Doe, welcome to your Pro Plan support.'),
             // test_prompt
-            TextResponseFake::make()
-                ->withText('Hello there!')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+            OpenRouterFake::completion('Hello there!'),
+        );
 
         $this->artisan('ai-workflow:prompt-test')
             ->expectsOutputToContain('Results: 2/2 passed')
@@ -82,11 +67,7 @@ class PromptTestCommandTest extends TestCase
 
     public function test_template_variables_are_injected(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello Jane Doe, I see you are on the Pro Plan. As a VIP, let me help you right away.')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello Jane Doe, I see you are on the Pro Plan. As a VIP, let me help you right away.'));
 
         $this->artisan('ai-workflow:prompt-test', ['prompt' => 'template_prompt'])
             ->expectsOutputToContain('PASS: VIP customer greeting')
@@ -95,13 +76,9 @@ class PromptTestCommandTest extends TestCase
 
     public function test_structured_assertion(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => 'billing', 'confidence' => '0.9'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['intent' => 'billing', 'confidence' => '0.9']));
 
-        $testFile = $this->createTempTestFile('structured_test', [
+        $this->createTempTestFile('structured_test', [
             'cases' => [
                 [
                     'name' => 'Intent classification',
@@ -118,17 +95,25 @@ class PromptTestCommandTest extends TestCase
         $this->artisan('ai-workflow:prompt-test', ['prompt' => 'structured_test'])
             ->expectsOutputToContain('PASS: Intent classification')
             ->assertExitCode(0);
+
+        $this->assertSame([
+            'name' => 'PromptTestSchema',
+            'strict' => true,
+            'schema' => [
+                'description' => 'Auto-generated schema from test assertions',
+                'type' => 'object',
+                'properties' => ['intent' => ['description' => 'intent', 'type' => 'string']],
+                'required' => ['intent'],
+                'additionalProperties' => false,
+            ],
+        ], OpenRouterFake::sentBodies()[0]['response_format']['json_schema']);
     }
 
     public function test_structured_assertion_failure(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['intent' => 'support'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['intent' => 'support']));
 
-        $testFile = $this->createTempTestFile('structured_fail', [
+        $this->createTempTestFile('structured_fail', [
             'cases' => [
                 [
                     'name' => 'Wrong classification',
@@ -149,18 +134,16 @@ class PromptTestCommandTest extends TestCase
 
     public function test_model_override(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello from override model!')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello from override model!'));
 
         $this->artisan('ai-workflow:prompt-test', [
             'prompt' => 'test_prompt',
-            '--model' => 'anthropic:claude-4',
+            '--model' => 'openrouter:other/model',
         ])
             ->expectsOutputToContain('PASS: Basic text response')
             ->assertExitCode(0);
+
+        $this->assertSame('other/model', OpenRouterFake::sentBodies()[0]['model']);
     }
 
     /**

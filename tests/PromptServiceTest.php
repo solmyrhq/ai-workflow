@@ -6,6 +6,7 @@ namespace AiWorkflow\Tests;
 
 use AiWorkflow\PromptData;
 use AiWorkflow\PromptService;
+use InvalidArgumentException;
 use RuntimeException;
 
 class PromptServiceTest extends TestCase
@@ -182,7 +183,7 @@ class PromptServiceTest extends TestCase
     {
         $prompt = new PromptData(id: 'test', model: 'anthropic:claude-4', prompt: 'test', reasoning: 8000);
 
-        $this->assertSame(['thinking' => ['enabled' => true, 'budgetTokens' => 8000]], $prompt->resolveReasoningOptions('anthropic', 16384));
+        $this->assertSame(['thinking' => ['type' => 'enabled', 'budget_tokens' => 8000]], $prompt->resolveReasoningOptions('anthropic', 16384));
     }
 
     public function test_resolve_reasoning_options_for_anthropic_effort(): void
@@ -190,7 +191,7 @@ class PromptServiceTest extends TestCase
         $prompt = new PromptData(id: 'test', model: 'anthropic:claude-4', prompt: 'test', reasoning: 'high');
 
         // high = 0.8 * 16384 = 13107
-        $this->assertSame(['thinking' => ['enabled' => true, 'budgetTokens' => 13107]], $prompt->resolveReasoningOptions('anthropic', 16384));
+        $this->assertSame(['thinking' => ['type' => 'enabled', 'budget_tokens' => 13107]], $prompt->resolveReasoningOptions('anthropic', 16384));
     }
 
     public function test_resolve_reasoning_options_for_anthropic_effort_clamps_minimum(): void
@@ -198,7 +199,7 @@ class PromptServiceTest extends TestCase
         $prompt = new PromptData(id: 'test', model: 'anthropic:claude-4', prompt: 'test', reasoning: 'minimal');
 
         // minimal = 0.1 * 2000 = 200, clamped to 1024
-        $this->assertSame(['thinking' => ['enabled' => true, 'budgetTokens' => 1024]], $prompt->resolveReasoningOptions('anthropic', 2000));
+        $this->assertSame(['thinking' => ['type' => 'enabled', 'budget_tokens' => 1024]], $prompt->resolveReasoningOptions('anthropic', 2000));
     }
 
     public function test_resolve_reasoning_options_for_anthropic_none_returns_empty(): void
@@ -212,28 +213,42 @@ class PromptServiceTest extends TestCase
     {
         $prompt = new PromptData(id: 'test', model: 'gemini:gemini-3-pro', prompt: 'test', reasoning: 'high');
 
-        $this->assertSame(['thinkingLevel' => 'high'], $prompt->resolveReasoningOptions('gemini', 16384));
+        $this->assertSame(['thinking_level' => 'high'], $prompt->resolveReasoningOptions('gemini', 16384));
     }
 
     public function test_resolve_reasoning_options_for_gemini_xhigh_maps_to_high(): void
     {
         $prompt = new PromptData(id: 'test', model: 'gemini:gemini-3-pro', prompt: 'test', reasoning: 'xhigh');
 
-        $this->assertSame(['thinkingLevel' => 'high'], $prompt->resolveReasoningOptions('gemini', 16384));
+        $this->assertSame(['thinking_level' => 'high'], $prompt->resolveReasoningOptions('gemini', 16384));
     }
 
-    public function test_resolve_reasoning_options_for_gemini_none_disables_thinking(): void
+    public function test_resolve_reasoning_options_for_gemini_none_asks_for_the_least_thinking(): void
     {
         $prompt = new PromptData(id: 'test', model: 'gemini:gemini-3-pro', prompt: 'test', reasoning: 'none');
 
-        $this->assertSame(['thinkingBudget' => 0], $prompt->resolveReasoningOptions('gemini', 16384));
+        $this->assertSame(['thinking_level' => 'minimal'], $prompt->resolveReasoningOptions('gemini', 16384));
     }
 
-    public function test_resolve_reasoning_options_for_gemini_max_tokens(): void
+    public function test_resolve_reasoning_options_for_gemini_rejects_a_token_budget(): void
     {
         $prompt = new PromptData(id: 'test', model: 'gemini:gemini-3-pro', prompt: 'test', reasoning: 8000);
 
-        $this->assertSame(['thinkingBudget' => 8000], $prompt->resolveReasoningOptions('gemini', 16384));
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Gemini only accepts an effort level');
+
+        $prompt->resolveReasoningOptions('gemini', 16384);
+    }
+
+    public function test_resolve_reasoning_options_for_ollama_and_xai(): void
+    {
+        $effort = new PromptData(id: 'test', model: 'xai:grok-4', prompt: 'test', reasoning: 'medium');
+        $none = new PromptData(id: 'test', model: 'xai:grok-4', prompt: 'test', reasoning: 'none');
+
+        $this->assertSame(['think' => true], $effort->resolveReasoningOptions('ollama', 16384));
+        $this->assertSame([], $none->resolveReasoningOptions('ollama', 16384));
+        $this->assertSame(['reasoning_effort' => 'high'], $effort->resolveReasoningOptions('xai', 16384));
+        $this->assertSame([], $none->resolveReasoningOptions('xai', 16384));
     }
 
     public function test_resolve_reasoning_options_returns_empty_when_null(): void

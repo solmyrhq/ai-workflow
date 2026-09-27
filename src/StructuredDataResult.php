@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace AiWorkflow;
 
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\ValueObjects\Usage;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\Usage;
 use Spatie\LaravelData\Data;
 
 class StructuredDataResult

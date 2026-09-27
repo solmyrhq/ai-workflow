@@ -6,73 +6,28 @@ namespace AiWorkflow\Tests;
 
 use AiWorkflow\AiService;
 use AiWorkflow\Events\AiWorkflowRequestFailed;
+use AiWorkflow\Exceptions\InsufficientCreditsException;
+use AiWorkflow\Exceptions\ProviderOverloadedException;
+use AiWorkflow\Exceptions\UpstreamErrorException;
 use AiWorkflow\Integrations\OpenRouterProvider;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Models\AiWorkflowRequest;
 use AiWorkflow\PromptData;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Concerns\MakesTestFixtures;
-use Generator;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Http;
 use Integrations\Enums\FailureClass;
 use Integrations\Models\Integration;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Enums\Provider as ProviderEnum;
-use Prism\Prism\Exceptions\PrismException;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\PrismManager;
-use Prism\Prism\Providers\Provider;
-use Prism\Prism\Streaming\Events\StreamStartEvent;
-use Prism\Prism\Testing\PrismFake;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\Text\Request as TextRequest;
-use Prism\Prism\Text\Response as TextResponse;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
 use RuntimeException;
-use Throwable;
 
 /**
- * End-to-end coverage that ai-workflow's OpenRouter calls now flow through the
- * laravel-integrations executor, and that the failure classifier behaves the
- * way the migration depends on: 402/403 stop immediately (no retry storm), 5xx
- * retries, and unmanaged providers fall back to direct Prism.
+ * End-to-end tests of how OpenRouter calls go through the laravel-integrations
+ * executor, and of how their failures are classified.
  */
 class IntegrationRoutingTest extends DatabaseTestCase
 {
     use MakesTestFixtures;
-
-    /**
-     * Install a PrismManager whose text() throws $exception, counting calls.
-     */
-    private function fakeTextThrowing(Throwable $exception): PrismFake
-    {
-        $fake = new class($exception) extends PrismFake
-        {
-            public int $calls = 0;
-
-            public function __construct(private readonly Throwable $exception)
-            {
-                parent::__construct([]);
-            }
-
-            public function text(TextRequest $request): TextResponse
-            {
-                $this->calls++;
-
-                throw $this->exception;
-            }
-        };
-
-        app()->instance(PrismManager::class, new class($fake) extends PrismManager
-        {
-            public function __construct(private readonly PrismFake $fake) {}
-
-            public function resolve(ProviderEnum|string $name, array $providerConfig = []): Provider
-            {
-                return $this->fake;
-            }
-        });
-
-        return $fake;
-    }
 
     private function openRouterIntegration(): Integration
     {
@@ -81,24 +36,16 @@ class IntegrationRoutingTest extends DatabaseTestCase
 
     public function test_billing_error_is_not_retried_and_keeps_breaker_closed(): void
     {
-        $fake = $this->fakeTextThrowing(PrismException::providerResponseError(
-            'OpenRouter: insufficient credits',
-            httpStatus: 402,
-            responseBody: '{"error":{"message":"insufficient credits"}}',
-        ));
-
-        $service = app(AiService::class);
+        OpenRouterFake::respondWith(OpenRouterFake::error(402, 'Insufficient credits'));
 
         try {
-            $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+            app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
             $this->fail('Expected the 402 to surface.');
-        } catch (PrismException $e) {
-            $this->assertSame(402, $e->httpStatus);
+        } catch (InsufficientCreditsException $e) {
+            $this->assertSame(402, $e->getStatusCode());
         }
 
-        // The whole point of the migration: a 402 is a Client fault, so it runs
-        // exactly once and never trips the shared breaker.
-        $this->assertSame(1, $fake->calls);
+        $this->assertCount(1, OpenRouterFake::sentBodies());
 
         $integration = $this->openRouterIntegration();
         $this->assertSame(0, $integration->consecutive_failures);
@@ -108,35 +55,27 @@ class IntegrationRoutingTest extends DatabaseTestCase
         $request = AiWorkflowRequest::first();
         $this->assertNotNull($request);
         $this->assertSame(402, $request->http_status);
-        $this->assertSame(PrismException::class, $request->error_class);
-        $this->assertNotNull($request->response_body);
+        $this->assertSame(InsufficientCreditsException::class, $request->error_class);
+        $this->assertSame('{"error":{"code":402,"message":"Insufficient credits"}}', $request->response_body);
     }
 
     public function test_server_error_is_retried_up_to_max_attempts(): void
     {
         config()->set('ai-workflow.retry.times', 3);
-        config()->set('ai-workflow.retry.jitter', false);
-        config()->set('ai-workflow.retry.server_error_multiplier_ms', 0);
 
-        $fake = $this->fakeTextThrowing(PrismException::providerResponseError(
-            'OpenRouter: upstream unavailable',
-            httpStatus: 503,
-            responseBody: '{"error":"unavailable"}',
-        ));
-
-        $service = app(AiService::class);
+        OpenRouterFake::respondWith(...array_fill(0, 3, OpenRouterFake::error(503, 'Unavailable')));
 
         try {
-            $service->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
+            app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $this->makePrompt());
             $this->fail('Expected the 503 to surface after exhausting retries.');
-        } catch (PrismException $e) {
-            $this->assertSame(503, $e->httpStatus);
+        } catch (ProviderOverloadedException $e) {
+            $this->assertSame(503, $e->getStatusCode());
         }
 
         // An Upstream fault is retryable, so it runs maxAttempts times and each
         // failure counts toward the breaker (threshold is higher, so it stays
         // closed here).
-        $this->assertSame(3, $fake->calls);
+        $this->assertCount(3, OpenRouterFake::sentBodies());
         $this->assertSame(3, $this->openRouterIntegration()->consecutive_failures);
     }
 
@@ -209,49 +148,18 @@ class IntegrationRoutingTest extends DatabaseTestCase
 
     public function test_stream_failure_counts_toward_breaker_and_health(): void
     {
-        $exception = PrismException::providerResponseError(
-            'OpenRouter: upstream unavailable',
-            httpStatus: 503,
-            responseBody: '{"error":"unavailable"}',
-        );
-
-        $fake = new class($exception) extends PrismFake
-        {
-            public function __construct(private readonly Throwable $exception)
-            {
-                parent::__construct([]);
-            }
-
-            public function stream(TextRequest $request): Generator
-            {
-                yield new StreamStartEvent(
-                    id: 'fake',
-                    timestamp: time(),
-                    model: 'test-model',
-                    provider: 'fake',
-                );
-
-                throw $this->exception;
-            }
-        };
-
-        app()->instance(PrismManager::class, new class($fake) extends PrismManager
-        {
-            public function __construct(private readonly PrismFake $fake) {}
-
-            public function resolve(ProviderEnum|string $name, array $providerConfig = []): Provider
-            {
-                return $this->fake;
-            }
-        });
+        OpenRouterFake::respondWith(OpenRouterFake::stream([
+            OpenRouterFake::chunk(['role' => 'assistant', 'content' => 'Partial']),
+            ['error' => ['code' => 503, 'message' => 'Upstream unavailable']],
+        ]));
 
         try {
             foreach (app(AiService::class)->streamMessages(collect([new UserMessage('Hello')]), $this->makePrompt()) as $event) {
-                // Drain until the fake throws mid-stream.
+                // Iterate until the stream error is thrown.
             }
             $this->fail('Expected the 503 to surface.');
-        } catch (PrismException $e) {
-            $this->assertSame(503, $e->httpStatus);
+        } catch (UpstreamErrorException $e) {
+            $this->assertSame(503, $e->errorCode);
         }
 
         // Streaming bypasses the executor, so the service itself must feed
@@ -261,9 +169,7 @@ class IntegrationRoutingTest extends DatabaseTestCase
 
     public function test_stream_success_resets_health(): void
     {
-        Prism::fake([
-            TextResponseFake::make()->withText('Streamed')->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::textStream(['Streamed']));
 
         $this->openRouterIntegration()->recordFailure(FailureClass::Upstream);
         $this->assertSame(1, $this->openRouterIntegration()->consecutive_failures);
@@ -287,9 +193,7 @@ class IntegrationRoutingTest extends DatabaseTestCase
             cacheTtl: 3600,
         );
 
-        Prism::fake([
-            TextResponseFake::make()->withText('Cached'),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Cached'));
 
         $service = app(AiService::class);
 
@@ -310,13 +214,18 @@ class IntegrationRoutingTest extends DatabaseTestCase
         $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
     }
 
-    public function test_unmanaged_provider_falls_back_to_direct_prism(): void
+    public function test_unmanaged_provider_skips_the_executor(): void
     {
-        // anthropic has no registered provider/integration, so the call should
-        // skip the executor entirely and hit Prism directly.
-        Prism::fake([
-            TextResponseFake::make()->withText('Direct response'),
-        ]);
+        config()->set('ai.providers.anthropic.key', 'anthropic-key');
+        Http::fake(['api.anthropic.com/*' => Http::response([
+            'id' => 'msg_1',
+            'type' => 'message',
+            'role' => 'assistant',
+            'model' => 'claude-4',
+            'content' => [['type' => 'text', 'text' => 'Direct response']],
+            'stop_reason' => 'end_turn',
+            'usage' => ['input_tokens' => 5, 'output_tokens' => 2],
+        ])]);
 
         $prompt = new PromptData(
             id: 'direct',
@@ -324,8 +233,7 @@ class IntegrationRoutingTest extends DatabaseTestCase
             prompt: 'You are helpful.',
         );
 
-        $service = app(AiService::class);
-        $response = $service->sendMessages(collect([new UserMessage('Hello')]), $prompt);
+        $response = app(AiService::class)->sendMessages(collect([new UserMessage('Hello')]), $prompt);
 
         $this->assertSame('Direct response', $response->text);
         $this->assertDatabaseCount('integration_requests', 0);

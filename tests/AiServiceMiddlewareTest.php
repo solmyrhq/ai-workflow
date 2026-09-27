@@ -5,22 +5,20 @@ declare(strict_types=1);
 namespace AiWorkflow\Tests;
 
 use AiWorkflow\AiService;
+use AiWorkflow\Enums\FinishReason;
 use AiWorkflow\Enums\GuardrailDirection;
 use AiWorkflow\Exceptions\GuardrailViolationException;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\Middleware\AiWorkflowContext;
 use AiWorkflow\Middleware\AiWorkflowMiddleware;
 use AiWorkflow\Middleware\InputGuardrail;
 use AiWorkflow\Middleware\OutputGuardrail;
+use AiWorkflow\Responses\ResponseMeta;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Responses\Usage;
+use AiWorkflow\Testing\OpenRouterFake;
 use AiWorkflow\Tests\Concerns\MakesTestFixtures;
 use Closure;
-use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\Testing\StructuredResponseFake;
-use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\Text\Response;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
-use Prism\Prism\ValueObjects\Meta;
-use Prism\Prism\ValueObjects\Usage;
 
 class AiServiceMiddlewareTest extends TestCase
 {
@@ -30,11 +28,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_middleware_called_in_order(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
         $order = [];
 
@@ -79,11 +73,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_middleware_can_modify_messages(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Modified response')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Modified response'));
 
         $messageCount = 0;
 
@@ -121,11 +111,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_middleware_can_modify_system_prompt(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('OK')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('OK'));
 
         $capturedPrompt = '';
 
@@ -162,21 +148,12 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_middleware_can_short_circuit(): void
     {
-        // No Prism::fake — the real call should never happen.
+        // Nothing is faked: a real request would fail as a stray request.
         $middleware = new class implements AiWorkflowMiddleware
         {
             public function handle(AiWorkflowContext $context, Closure $next): AiWorkflowContext
             {
-                $context->response = new Response(
-                    steps: collect([]),
-                    text: 'Short-circuited',
-                    finishReason: FinishReason::Stop,
-                    toolCalls: [],
-                    toolResults: [],
-                    usage: new Usage(0, 0),
-                    meta: new Meta(id: '', model: 'test'),
-                    messages: collect([]),
-                );
+                $context->response = new TextResponse('Short-circuited', FinishReason::Stop, new Usage, new ResponseMeta(model: 'test'));
 
                 return $context;
             }
@@ -192,23 +169,19 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_middleware_can_inspect_response(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Original response')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Original response'));
 
         $capturedResponse = null;
 
         $middleware = new class($capturedResponse) implements AiWorkflowMiddleware
         {
-            public function __construct(private ?Response &$captured) {}
+            public function __construct(private ?TextResponse &$captured) {}
 
             public function handle(AiWorkflowContext $context, Closure $next): AiWorkflowContext
             {
                 $context = $next($context);
 
-                if ($context->response instanceof Response) {
+                if ($context->response instanceof TextResponse) {
                     $this->captured = $context->response;
                 }
 
@@ -227,11 +200,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_middleware_applies_to_structured_messages(): void
     {
-        Prism::fake([
-            StructuredResponseFake::make()
-                ->withStructured(['answer' => 'test'])
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::structured(['answer' => 'test']));
 
         $called = false;
 
@@ -265,11 +234,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_clear_middleware_removes_all(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
         $called = false;
 
@@ -296,11 +261,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_global_middleware_resolved_from_config(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Hello')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Hello'));
 
         // Register a test middleware in the container
         $called = false;
@@ -348,11 +309,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_input_guardrail_passes_when_valid(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Allowed')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Allowed'));
 
         $guardrail = new class extends InputGuardrail
         {
@@ -374,17 +331,13 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_output_guardrail_blocks_after_response(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Bad content')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Bad content'));
 
         $guardrail = new class extends OutputGuardrail
         {
             protected function validate(AiWorkflowContext $context): void
             {
-                if ($context->response instanceof Response && str_contains($context->response->text, 'Bad')) {
+                if ($context->response instanceof TextResponse && str_contains($context->response->text, 'Bad')) {
                     throw new GuardrailViolationException('content-filter', GuardrailDirection::Output, 'Response contains bad content');
                 }
             }
@@ -401,11 +354,7 @@ class AiServiceMiddlewareTest extends TestCase
 
     public function test_output_guardrail_passes_when_valid(): void
     {
-        Prism::fake([
-            TextResponseFake::make()
-                ->withText('Good content')
-                ->withFinishReason(FinishReason::Stop),
-        ]);
+        OpenRouterFake::respondWith(OpenRouterFake::completion('Good content'));
 
         $guardrail = new class extends OutputGuardrail
         {

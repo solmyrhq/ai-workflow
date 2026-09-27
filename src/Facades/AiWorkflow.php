@@ -5,30 +5,31 @@ declare(strict_types=1);
 namespace AiWorkflow\Facades;
 
 use AiWorkflow\AiService;
+use AiWorkflow\Messages\Message;
 use AiWorkflow\Middleware\AiWorkflowMiddleware;
 use AiWorkflow\Models\AiWorkflowExecution;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Schema\ResponseSchema;
+use AiWorkflow\Streaming\StreamEvent;
 use AiWorkflow\StructuredDataResult;
+use AiWorkflow\Tools\Tool;
 use Closure;
 use Generator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Facade;
 use Override;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Streaming\Events\StreamEvent;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Text\Response;
-use Prism\Prism\Tool;
 
 /**
- * @method static Response sendMessages(Collection<int, \Prism\Prism\Contracts\Message> $messages, \AiWorkflow\PromptData $prompt, ?\AiWorkflow\PromptData $extraContext = null, ?int $steps = null)
- * @method static StructuredResponse sendStructuredMessages(Collection<int, \Prism\Prism\Contracts\Message> $messages, \AiWorkflow\PromptData $prompt, ObjectSchema $schema, ?string $modelOverride = null)
- * @method static StructuredResponse sendStructuredMessagesWithTools(Collection<int, \Prism\Prism\Contracts\Message> $messages, \AiWorkflow\PromptData $prompt, ObjectSchema $schema)
- * @method static Generator<int, StreamEvent, mixed, void> streamMessages(Collection<int, \Prism\Prism\Contracts\Message> $messages, \AiWorkflow\PromptData $prompt, ?\AiWorkflow\PromptData $extraContext = null, ?int $steps = null)
+ * @method static TextResponse sendMessages(Collection<int, Message> $messages, \AiWorkflow\PromptData $prompt, ?\AiWorkflow\PromptData $extraContext = null, ?int $steps = null)
+ * @method static StructuredResponse sendStructuredMessages(Collection<int, Message> $messages, \AiWorkflow\PromptData $prompt, ResponseSchema $schema, ?string $modelOverride = null)
+ * @method static StructuredResponse sendStructuredMessagesWithTools(Collection<int, Message> $messages, \AiWorkflow\PromptData $prompt, ResponseSchema $schema)
+ * @method static Generator<int, StreamEvent, mixed, void> streamMessages(Collection<int, Message> $messages, \AiWorkflow\PromptData $prompt, ?\AiWorkflow\PromptData $extraContext = null, ?int $steps = null)
  * @method static void setContext(array<string, mixed> $context)
  * @method static array<string, mixed> getContext()
  * @method static void setTags(list<string> $tags)
  * @method static list<string> getTags()
- * @method static StructuredDataResult sendStructuredData(Collection<int, \Prism\Prism\Contracts\Message> $messages, \AiWorkflow\PromptData $prompt, class-string<\Spatie\LaravelData\Data> $dataClass, int $maxAttempts = 3)
+ * @method static StructuredDataResult sendStructuredData(Collection<int, Message> $messages, \AiWorkflow\PromptData $prompt, class-string<\Spatie\LaravelData\Data> $dataClass, int $maxAttempts = 3)
  * @method static void addMiddleware(AiWorkflowMiddleware $middleware)
  * @method static void clearMiddleware()
  * @method static void resolveToolsUsing(Closure $resolver)

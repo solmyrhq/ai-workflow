@@ -211,7 +211,7 @@ class EvalReportMetricsTest extends DatabaseTestCase
         );
     }
 
-    public function test_gemini_thought_tokens_bill_at_the_output_rate_on_top_of_the_output(): void
+    public function test_direct_gemini_thought_tokens_are_billed_as_part_of_the_output(): void
     {
         config(['ai-workflow.model_pricing' => [
             'gemini:a' => ['input' => 1.0, 'output' => 2.0],
@@ -228,7 +228,7 @@ class EvalReportMetricsTest extends DatabaseTestCase
 
         $this->assertSame(800, $a->thoughtTokens);
         $this->assertEqualsWithDelta(
-            (200 / 1_000_000 * 1.0) + ((400 + 800) / 1_000_000 * 2.0),
+            (200 / 1_000_000 * 1.0) + (400 / 1_000_000 * 2.0),
             $a->cost ?? 0.0,
             1e-9,
         );
@@ -258,7 +258,7 @@ class EvalReportMetricsTest extends DatabaseTestCase
         );
     }
 
-    public function test_anthropic_cache_tokens_are_priced_on_top_of_the_input(): void
+    public function test_direct_anthropic_cache_tokens_are_priced_within_the_input(): void
     {
         config(['ai-workflow.model_pricing' => [
             'anthropic:a' => ['input' => 1.0, 'output' => 2.0, 'cache_read' => 0.1, 'cache_write' => 1.25],
@@ -274,7 +274,7 @@ class EvalReportMetricsTest extends DatabaseTestCase
         $a = $this->summaryFor($report->models, 'anthropic:a');
 
         $this->assertEqualsWithDelta(
-            (200 / 1_000_000 * 1.0) + (120 / 1_000_000 * 0.1) + (40 / 1_000_000 * 1.25) + (400 / 1_000_000 * 2.0),
+            (40 / 1_000_000 * 1.0) + (120 / 1_000_000 * 0.1) + (40 / 1_000_000 * 1.25) + (400 / 1_000_000 * 2.0),
             $a->cost ?? 0.0,
             1e-9,
         );

@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Middleware;
 
+use AiWorkflow\Messages\Message;
 use AiWorkflow\PromptData;
-use Prism\Prism\Contracts\Message;
-use Prism\Prism\Schema\ObjectSchema;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Text\Response;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
+use AiWorkflow\Schema\ResponseSchema;
 
 class AiWorkflowContext
 {
@@ -21,8 +21,8 @@ class AiWorkflowContext
         public PromptData $prompt,
         public string $systemPrompt,
         public readonly string $method,
-        public ?ObjectSchema $schema = null,
-        public Response|StructuredResponse|null $response = null,
+        public ?ResponseSchema $schema = null,
+        public TextResponse|StructuredResponse|null $response = null,
         public array $metadata = [],
     ) {}
 }

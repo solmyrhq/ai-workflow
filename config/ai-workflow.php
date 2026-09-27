@@ -24,7 +24,8 @@ return [
         'rate_limit_per_minute' => null,
     ],
 
-    // Client options passed to Prism's withClientOptions().
+    // Guzzle request options for AI calls. `timeout` (seconds) applies to
+    // every provider; the other options apply to OpenRouter only.
     'client_options' => [
         'timeout' => 600,
         'curl' => [

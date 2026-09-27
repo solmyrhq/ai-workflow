@@ -4,9 +4,17 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Tests;
 
+use AiWorkflow\Enums\FinishReason;
+use AiWorkflow\Exceptions\InsufficientCreditsException;
+use AiWorkflow\Exceptions\ProviderConnectionException;
+use AiWorkflow\Exceptions\ProviderOverloadedException;
+use AiWorkflow\Exceptions\ProviderRequestException;
+use AiWorkflow\Exceptions\RateLimitedException;
+use AiWorkflow\Exceptions\StructuredDecodingException;
+use AiWorkflow\Exceptions\UnexpectedFinishReasonException;
+use AiWorkflow\Exceptions\UpstreamErrorException;
 use AiWorkflow\Integrations\OpenRouterCredentials;
 use AiWorkflow\Integrations\OpenRouterProvider;
-use AiWorkflow\PrismExceptionInspector;
 use Illuminate\Http\Client\ConnectionException;
 use Integrations\Contracts\ClassifiesFailures;
 use Integrations\Contracts\CustomizesRetry;
@@ -14,21 +22,13 @@ use Integrations\Contracts\DeclaresRateLimit;
 use Integrations\Contracts\IntegrationProvider;
 use Integrations\Enums\FailureClass;
 use Integrations\Enums\RateLimitWindow;
-use Prism\Prism\Exceptions\PrismException;
-use Prism\Prism\Exceptions\PrismProviderOverloadedException;
-use Prism\Prism\Exceptions\PrismRateLimitedException;
-use Prism\Prism\Exceptions\PrismRequestTooLargeException;
-use Prism\Prism\Exceptions\PrismStructuredDecodingException;
 use RuntimeException;
 
 class OpenRouterProviderTest extends TestCase
 {
-    private function providerResponse(string $message, int $status): PrismException
+    private function providerResponse(string $message, int $status): ProviderRequestException
     {
-        $exception = new PrismException($message);
-        $exception->httpStatus = $status;
-
-        return $exception;
+        return new ProviderRequestException($message, 'openrouter', $status);
     }
 
     public function test_implements_required_contracts(): void
@@ -49,9 +49,10 @@ class OpenRouterProviderTest extends TestCase
 
         // 402/403 are the storm trigger: Client means non-retryable and the
         // breaker never trips.
-        $this->assertSame(FailureClass::Client, $provider->classifyFailure($this->providerResponse('payment required', 402)));
+        $this->assertSame(FailureClass::Client, $provider->classifyFailure(new InsufficientCreditsException('payment required', 'openrouter', 402)));
         $this->assertSame(FailureClass::Client, $provider->classifyFailure($this->providerResponse('forbidden', 403)));
         $this->assertSame(FailureClass::Client, $provider->classifyFailure($this->providerResponse('bad request', 400)));
+        $this->assertSame(FailureClass::Client, $provider->classifyFailure($this->providerResponse('too large', 413)));
     }
 
     public function test_429_classifies_as_throttle(): void
@@ -59,6 +60,7 @@ class OpenRouterProviderTest extends TestCase
         $provider = new OpenRouterProvider;
 
         $this->assertSame(FailureClass::Throttle, $provider->classifyFailure($this->providerResponse('slow down', 429)));
+        $this->assertSame(FailureClass::Throttle, $provider->classifyFailure(new RateLimitedException('slow down', 'openrouter')));
     }
 
     public function test_5xx_classifies_as_upstream(): void
@@ -66,51 +68,41 @@ class OpenRouterProviderTest extends TestCase
         $provider = new OpenRouterProvider;
 
         $this->assertSame(FailureClass::Upstream, $provider->classifyFailure($this->providerResponse('server error', 500)));
-        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure($this->providerResponse('unavailable', 503)));
+        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new ProviderOverloadedException('unavailable', 'openrouter', 503)));
     }
 
-    public function test_prism_exception_types_classify_explicitly(): void
+    public function test_connection_failures_and_unexpected_finish_reasons_classify_as_upstream(): void
     {
         $provider = new OpenRouterProvider;
 
-        $this->assertSame(FailureClass::Throttle, $provider->classifyFailure(PrismRateLimitedException::make()));
-        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(PrismProviderOverloadedException::make('openrouter')));
-        $this->assertSame(FailureClass::Client, $provider->classifyFailure(PrismRequestTooLargeException::make('openrouter')));
+        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new ProviderConnectionException('network down', 'openrouter')));
         $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new ConnectionException('network down')));
+        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new UnexpectedFinishReasonException(FinishReason::Unknown, 'openrouter')));
     }
 
-    public function test_bare_prism_exception_without_status_is_upstream(): void
+    public function test_an_error_envelope_classifies_by_its_error_code(): void
     {
         $provider = new OpenRouterProvider;
 
-        // Prism surfaces some provider faults (e.g. a 500 returned as 200 + an
-        // error body) as a status-less PrismException; treat those as transient.
-        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new PrismException('OpenRouter: unknown error')));
+        $this->assertSame(FailureClass::Client, $provider->classifyFailure(new UpstreamErrorException('bad', 'openrouter', errorCode: 400)));
+        $this->assertSame(FailureClass::Throttle, $provider->classifyFailure(new UpstreamErrorException('slow', 'openrouter', errorCode: 429)));
+        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new UpstreamErrorException('down', 'openrouter', errorCode: 502)));
+        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new UpstreamErrorException('unknown', 'openrouter')));
+        $this->assertSame(FailureClass::Upstream, $provider->classifyFailure(new UpstreamErrorException('odd', 'openrouter', errorCode: 200)));
     }
 
-    public function test_status_is_read_through_a_body_only_wrapper(): void
+    public function test_status_is_read_through_a_wrapper_without_one(): void
     {
-        // Prism sometimes rethrows with only the body attached while an inner
-        // exception still carries the status. Dropping it here would turn a
-        // billing 402 into a retryable Upstream fault.
-        $inner = new PrismException('payment required');
-        $inner->httpStatus = 402;
+        $wrapped = new RuntimeException('OpenRouter request failed', previous: $this->providerResponse('payment required', 402));
 
-        $outer = new PrismException('OpenRouter request failed', previous: $inner);
-        $outer->responseBody = '{"error":{"message":"insufficient credits"}}';
-
-        $this->assertSame(
-            ['status' => 402, 'body' => '{"error":{"message":"insufficient credits"}}'],
-            PrismExceptionInspector::extract($outer),
-        );
-        $this->assertSame(FailureClass::Client, (new OpenRouterProvider)->classifyFailure($outer));
+        $this->assertSame(FailureClass::Client, (new OpenRouterProvider)->classifyFailure($wrapped));
     }
 
     public function test_structured_decoding_defers_so_fallback_handles_it(): void
     {
         $provider = new OpenRouterProvider;
 
-        $this->assertNull($provider->classifyFailure(PrismStructuredDecodingException::make('invalid json')));
+        $this->assertNull($provider->classifyFailure(new StructuredDecodingException('invalid json', 'openrouter', 'not json')));
     }
 
     public function test_unrelated_exception_defers_to_core_classifier(): void
@@ -134,10 +126,9 @@ class OpenRouterProviderTest extends TestCase
 
         $provider = new OpenRouterProvider;
 
-        // The executor can't read Prism's status property, so it passes null;
-        // the provider re-reads it from the exception.
         $this->assertSame(30_000, $provider->retryDelayMs($this->providerResponse('slow', 429), 1, null));
-        $this->assertSame(30_000, $provider->retryDelayMs(PrismRateLimitedException::make(), 1, null));
+        $this->assertSame(30_000, $provider->retryDelayMs(new RateLimitedException('slow', 'openrouter', 429), 1, null));
+        $this->assertSame(30_000, $provider->retryDelayMs(new UpstreamErrorException('slow', 'openrouter', errorCode: 429), 1, null));
     }
 
     public function test_retry_delay_honors_retry_after(): void
@@ -146,10 +137,10 @@ class OpenRouterProviderTest extends TestCase
 
         $provider = new OpenRouterProvider;
 
-        $this->assertSame(10_000, $provider->retryDelayMs(PrismRateLimitedException::make(retryAfter: 10), 1, null));
+        $this->assertSame(10_000, $provider->retryDelayMs(new RateLimitedException('slow', 'openrouter', 429, retryAfter: 10), 1, null));
     }
 
-    public function test_retry_delay_grows_linearly_for_5xx(): void
+    public function test_retry_delay_grows_linearly_for_upstream_faults(): void
     {
         config()->set('ai-workflow.retry.jitter', false);
         config()->set('ai-workflow.retry.server_error_multiplier_ms', 2_000);
@@ -157,7 +148,9 @@ class OpenRouterProviderTest extends TestCase
         $provider = new OpenRouterProvider;
 
         $this->assertSame(4_000, $provider->retryDelayMs($this->providerResponse('boom', 500), 2, null));
-        $this->assertSame(6_000, $provider->retryDelayMs(PrismProviderOverloadedException::make('openrouter'), 3, null));
+        $this->assertSame(6_000, $provider->retryDelayMs(new ProviderOverloadedException('overloaded', 'openrouter', 503), 3, null));
+        $this->assertSame(2_000, $provider->retryDelayMs(new UnexpectedFinishReasonException(FinishReason::Error, 'openrouter'), 1, null));
+        $this->assertSame(4_000, $provider->retryDelayMs(new UpstreamErrorException('down', 'openrouter', errorCode: 502), 2, null));
     }
 
     public function test_retry_delay_defers_for_non_retryable_status(): void

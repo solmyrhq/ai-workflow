@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace AiWorkflow\Eval;
 
 use AiWorkflow\AiWorkflowReplayer;
+use AiWorkflow\Exceptions\HttpErrorDetails;
 use AiWorkflow\Models\AiWorkflowEvalRun;
 use AiWorkflow\Models\AiWorkflowEvalScore;
 use AiWorkflow\Models\AiWorkflowRequest;
-use AiWorkflow\PrismExceptionInspector;
+use AiWorkflow\Responses\StructuredResponse;
+use AiWorkflow\Responses\TextResponse;
 use Illuminate\Support\Facades\Log;
 use Integrations\Contracts\CustomizesRetry;
 use Integrations\Contracts\IntegrationProvider;
@@ -17,8 +19,6 @@ use Integrations\IntegrationManager;
 use Integrations\RetryHandler;
 use Integrations\Support\FailureClassifier;
 use Integrations\Support\ResponseHelper;
-use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Text\Response;
 use Throwable;
 
 class AiWorkflowEvalRunner
@@ -88,11 +88,11 @@ class AiWorkflowEvalRunner
                         'model' => $model,
                         'score' => 0.0,
                         'details' => ['error' => $e->getMessage()],
-                        'input_tokens' => $response?->usage->promptTokens,
-                        'output_tokens' => $response?->usage->completionTokens,
+                        'input_tokens' => $response?->usage->inputTokens,
+                        'output_tokens' => $response?->usage->outputTokens,
                         'thought_tokens' => $response?->usage->thoughtTokens,
-                        'cache_read_tokens' => $response?->usage->cacheReadInputTokens,
-                        'cache_write_tokens' => $response?->usage->cacheWriteInputTokens,
+                        'cache_read_tokens' => $response?->usage->cacheReadTokens,
+                        'cache_write_tokens' => $response?->usage->cacheWriteTokens,
                         'duration_ms' => $durationMs,
                         'ground_truth' => $this->groundTruthFor($request),
                     ]);
@@ -111,11 +111,11 @@ class AiWorkflowEvalRunner
                     'details' => $result->details !== [] ? $result->details : null,
                     'response_text' => $response instanceof StructuredResponse ? null : $response->text,
                     'structured_response' => $response instanceof StructuredResponse ? $response->structured : null,
-                    'input_tokens' => $response->usage->promptTokens,
-                    'output_tokens' => $response->usage->completionTokens,
+                    'input_tokens' => $response->usage->inputTokens,
+                    'output_tokens' => $response->usage->outputTokens,
                     'thought_tokens' => $response->usage->thoughtTokens,
-                    'cache_read_tokens' => $response->usage->cacheReadInputTokens,
-                    'cache_write_tokens' => $response->usage->cacheWriteInputTokens,
+                    'cache_read_tokens' => $response->usage->cacheReadTokens,
+                    'cache_write_tokens' => $response->usage->cacheWriteTokens,
                     'duration_ms' => $durationMs,
                     'ground_truth' => $this->groundTruthFor($request),
                     'predicted' => $result->predicted,
@@ -130,7 +130,7 @@ class AiWorkflowEvalRunner
      * Replay one request with the failure classification and retry delay used
      * for ordinary AI requests.
      */
-    private function replay(AiWorkflowRequest $request, string $model): Response|StructuredResponse
+    private function replay(AiWorkflowRequest $request, string $model): TextResponse|StructuredResponse
     {
         $attempts = config('ai-workflow.eval.replay_tries');
         $attempts = is_int($attempts) && $attempts > 0 ? $attempts : self::DEFAULT_REPLAY_TRIES;
@@ -180,14 +180,14 @@ class AiWorkflowEvalRunner
             return $failureClass->isRetryable();
         }
 
-        $status = PrismExceptionInspector::httpStatus($error);
+        $status = HttpErrorDetails::status($error);
 
         return $status !== null && FailureClass::fromStatus($status)->isRetryable();
     }
 
     private function retryDelayMs(Throwable $error, int $attempt, ?IntegrationProvider $provider): int
     {
-        $status = ResponseHelper::extractStatusCode($error) ?? PrismExceptionInspector::httpStatus($error);
+        $status = ResponseHelper::extractStatusCode($error) ?? HttpErrorDetails::status($error);
 
         if ($provider instanceof CustomizesRetry) {
             $delayMs = $provider->retryDelayMs($error, $attempt, $status);

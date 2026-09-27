@@ -4,261 +4,170 @@ declare(strict_types=1);
 
 namespace AiWorkflow\Tests;
 
+use AiWorkflow\Messages\AssistantMessage;
+use AiWorkflow\Messages\Attachment;
+use AiWorkflow\Messages\AttachmentKind;
+use AiWorkflow\Messages\Message;
+use AiWorkflow\Messages\SystemMessage;
+use AiWorkflow\Messages\ToolCall;
+use AiWorkflow\Messages\ToolResult;
+use AiWorkflow\Messages\ToolResultMessage;
+use AiWorkflow\Messages\UserMessage;
 use AiWorkflow\MessageSerializer;
-use Prism\Prism\ValueObjects\Media\Audio;
-use Prism\Prism\ValueObjects\Media\Document;
-use Prism\Prism\ValueObjects\Media\Image;
-use Prism\Prism\ValueObjects\Media\Text;
-use Prism\Prism\ValueObjects\Media\Video;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
-use Prism\Prism\ValueObjects\Messages\SystemMessage;
-use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
-use Prism\Prism\ValueObjects\ToolCall;
-use Prism\Prism\ValueObjects\ToolResult;
 
 class MessageSerializerTest extends TestCase
 {
     public function test_roundtrip_image_base64(): void
     {
-        $image = Image::fromBase64('iVBORw0KGgo=', 'image/png');
-        $message = new UserMessage('Describe this image', [$image]);
-
-        $serialized = MessageSerializer::serialize([$message]);
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(1, $deserialized);
-        $this->assertInstanceOf(UserMessage::class, $deserialized[0]);
-        $this->assertSame('Describe this image', $deserialized[0]->content);
-
-        $images = $deserialized[0]->images();
-        $this->assertCount(1, $images);
-        $this->assertSame('iVBORw0KGgo=', $images[0]->base64());
-        $this->assertSame('image/png', $images[0]->mimeType());
+        $this->assertRoundTrip(new UserMessage('Describe this image', [Attachment::fromBase64(AttachmentKind::Image, 'iVBORw0KGgo=', 'image/png')]));
     }
 
     public function test_roundtrip_image_url(): void
     {
-        $image = Image::fromUrl('https://example.com/photo.jpg', 'image/jpeg');
-        $message = new UserMessage('What is this?', [$image]);
-
-        $serialized = MessageSerializer::serialize([$message]);
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(1, $deserialized);
-        $images = $deserialized[0]->images();
-        $this->assertCount(1, $images);
-        $this->assertSame('https://example.com/photo.jpg', $images[0]->url());
-        $this->assertSame('image/jpeg', $images[0]->mimeType());
+        $this->assertRoundTrip(new UserMessage('What is this?', [Attachment::fromUrl(AttachmentKind::Image, 'https://example.com/photo.jpg', 'image/jpeg')]));
     }
 
     public function test_roundtrip_document_with_title(): void
     {
-        $doc = Document::fromBase64('JVBERi0xLjQ=', 'application/pdf', 'Invoice');
-        $message = new UserMessage('Summarize this', [$doc]);
-
-        $serialized = MessageSerializer::serialize([$message]);
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(1, $deserialized);
-        $documents = $deserialized[0]->documents();
-        $this->assertCount(1, $documents);
-        $this->assertSame('JVBERi0xLjQ=', $documents[0]->base64());
-        $this->assertSame('application/pdf', $documents[0]->mimeType());
-        $this->assertSame('Invoice', $documents[0]->documentTitle());
+        $this->assertRoundTrip(new UserMessage('Summarize this', [Attachment::fromBase64(AttachmentKind::Document, 'JVBERi0xLjQ=', 'application/pdf', 'Invoice')]));
     }
 
     public function test_roundtrip_audio(): void
     {
-        $audio = Audio::fromBase64('AAAA', 'audio/mp3');
-        $message = new UserMessage('Transcribe this', [$audio]);
-
-        $serialized = MessageSerializer::serialize([$message]);
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(1, $deserialized);
-        $audios = $deserialized[0]->audios();
-        $this->assertCount(1, $audios);
-        $this->assertSame('AAAA', $audios[0]->base64());
-        $this->assertSame('audio/mp3', $audios[0]->mimeType());
+        $this->assertRoundTrip(new UserMessage('Transcribe this', [Attachment::fromBase64(AttachmentKind::Audio, 'AAAA', 'audio/mp3')]));
     }
 
     public function test_roundtrip_video(): void
     {
-        $video = Video::fromUrl('https://example.com/clip.mp4', 'video/mp4');
-        $message = new UserMessage('Describe this video', [$video]);
-
-        $serialized = MessageSerializer::serialize([$message]);
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(1, $deserialized);
-        $videos = $deserialized[0]->videos();
-        $this->assertCount(1, $videos);
-        $this->assertSame('https://example.com/clip.mp4', $videos[0]->url());
+        $this->assertRoundTrip(new UserMessage('Describe this video', [Attachment::fromUrl(AttachmentKind::Video, 'https://example.com/clip.mp4', 'video/mp4')]));
     }
 
     public function test_roundtrip_mixed_media(): void
     {
-        $image = Image::fromBase64('iVBORw0KGgo=', 'image/png');
-        $doc = Document::fromUrl('https://example.com/doc.pdf', 'Report');
-        $extra = new Text('Extra context here');
-        $message = new UserMessage('Analyze all of this', [$image, $doc, $extra]);
+        $this->assertRoundTrip(new UserMessage('Analyze all of this', [
+            Attachment::fromBase64(AttachmentKind::Image, 'iVBORw0KGgo=', 'image/png'),
+            Attachment::fromUrl(AttachmentKind::Document, 'https://example.com/doc.pdf', title: 'Report'),
+            Attachment::text('Extra context here'),
+        ]));
+    }
 
-        $serialized = MessageSerializer::serialize([$message]);
-        $deserialized = MessageSerializer::deserialize($serialized);
+    public function test_only_documents_keep_a_title(): void
+    {
+        $serialized = MessageSerializer::serialize([
+            new UserMessage('Look', [Attachment::fromBase64(AttachmentKind::Image, 'iVBORw0KGgo=', 'image/png', 'Ignored')]),
+        ]);
 
-        $this->assertCount(1, $deserialized);
-        $restored = $deserialized[0];
-        $this->assertInstanceOf(UserMessage::class, $restored);
-        $this->assertSame('Analyze all of this', $restored->content);
-        $this->assertCount(1, $restored->images());
-        $this->assertCount(1, $restored->documents());
+        $this->assertSame(
+            [['type' => 'user', 'content' => 'Look', 'additional_content' => [['media_type' => 'image', 'base64' => 'iVBORw0KGgo=', 'mime_type' => 'image/png']]]],
+            $serialized,
+        );
     }
 
     public function test_backward_compat_without_additional_content(): void
     {
         // Old serialized format — no additional_content key.
-        $oldData = [
-            ['type' => 'user', 'content' => 'Hello world'],
-        ];
+        $deserialized = MessageSerializer::deserialize([['type' => 'user', 'content' => 'Hello world']]);
 
-        $deserialized = MessageSerializer::deserialize($oldData);
+        $this->assertEquals([new UserMessage('Hello world')], $deserialized);
+    }
 
-        $this->assertCount(1, $deserialized);
-        $this->assertInstanceOf(UserMessage::class, $deserialized[0]);
-        $this->assertSame('Hello world', $deserialized[0]->content);
+    public function test_an_unknown_media_type_reads_back_as_generic_media(): void
+    {
+        $deserialized = MessageSerializer::deserialize([
+            ['type' => 'user', 'content' => 'Hi', 'additional_content' => [['media_type' => 'hologram', 'base64' => 'AAAA', 'mime_type' => 'application/x-hologram']]],
+        ]);
+
+        $this->assertEquals(
+            [new UserMessage('Hi', [new Attachment(AttachmentKind::Media, base64: 'AAAA', mimeType: 'application/x-hologram')])],
+            $deserialized,
+        );
     }
 
     public function test_text_only_message_has_no_additional_content_key(): void
     {
-        $message = new UserMessage('Just text');
+        $serialized = MessageSerializer::serialize([new UserMessage('Just text')]);
 
-        $serialized = MessageSerializer::serialize([$message]);
-
-        $this->assertArrayNotHasKey('additional_content', $serialized[0]);
-        $this->assertSame('user', $serialized[0]['type']);
-        $this->assertSame('Just text', $serialized[0]['content']);
+        $this->assertSame([['type' => 'user', 'content' => 'Just text']], $serialized);
     }
 
     public function test_extra_text_parts_are_preserved(): void
     {
-        $extra = new Text('Additional context');
-        $message = new UserMessage('Main question', [$extra]);
+        $serialized = MessageSerializer::serialize([new UserMessage('Main question', [Attachment::text('Additional context')])]);
 
-        $serialized = MessageSerializer::serialize([$message]);
-
-        $this->assertArrayHasKey('additional_content', $serialized[0]);
-        $this->assertCount(1, $serialized[0]['additional_content']);
-        $this->assertSame('text', $serialized[0]['additional_content'][0]['media_type']);
-        $this->assertSame('Additional context', $serialized[0]['additional_content'][0]['text']);
+        $this->assertSame([['media_type' => 'text', 'text' => 'Additional context']], $serialized[0]['additional_content']);
     }
 
     public function test_roundtrip_assistant_message_with_tool_calls(): void
     {
-        $toolCall = new ToolCall(id: 'call-1', name: 'search', arguments: ['query' => 'test', 'limit' => 5]);
-        $message = new AssistantMessage('Let me search for that', [$toolCall]);
+        $message = new AssistantMessage('Let me search for that', [new ToolCall('call-1', 'search', ['query' => 'test', 'limit' => 5])]);
 
-        $serialized = MessageSerializer::serialize([$message]);
+        $this->assertSame([[
+            'type' => 'assistant',
+            'content' => 'Let me search for that',
+            'tool_calls' => [['id' => 'call-1', 'name' => 'search', 'arguments' => ['query' => 'test', 'limit' => 5]]],
+        ]], MessageSerializer::serialize([$message]));
 
-        $this->assertSame('assistant', $serialized[0]['type']);
-        $this->assertSame('Let me search for that', $serialized[0]['content']);
-        $this->assertCount(1, $serialized[0]['tool_calls']);
-        $this->assertSame('call-1', $serialized[0]['tool_calls'][0]['id']);
-        $this->assertSame('search', $serialized[0]['tool_calls'][0]['name']);
-        $this->assertSame(['query' => 'test', 'limit' => 5], $serialized[0]['tool_calls'][0]['arguments']);
+        $this->assertRoundTrip($message);
+    }
 
-        $deserialized = MessageSerializer::deserialize($serialized);
+    public function test_provider_state_is_not_stored(): void
+    {
+        $message = new AssistantMessage('Thinking done', [new ToolCall('call-1', 'search', [], ['provider' => 'openrouter'])], ['provider' => 'openrouter', 'replay_blocks' => ['reasoning' => 'x']]);
 
-        $this->assertCount(1, $deserialized);
-        $this->assertInstanceOf(AssistantMessage::class, $deserialized[0]);
-        $this->assertSame('Let me search for that', $deserialized[0]->content);
-        $this->assertCount(1, $deserialized[0]->toolCalls);
-        $this->assertSame('call-1', $deserialized[0]->toolCalls[0]->id);
-        $this->assertSame('search', $deserialized[0]->toolCalls[0]->name);
-        $this->assertSame(['query' => 'test', 'limit' => 5], $deserialized[0]->toolCalls[0]->arguments());
+        $this->assertEquals(
+            [new AssistantMessage('Thinking done', [new ToolCall('call-1', 'search')])],
+            MessageSerializer::deserialize(MessageSerializer::serialize([$message])),
+        );
     }
 
     public function test_roundtrip_tool_result_message(): void
     {
-        $toolResult = new ToolResult(
-            toolCallId: 'call-1',
-            toolName: 'search',
-            args: ['query' => 'test'],
-            result: ['count' => 3, 'items' => ['a', 'b', 'c']],
-        );
-        $message = new ToolResultMessage([$toolResult]);
+        $message = new ToolResultMessage([
+            new ToolResult('call-1', 'search', ['query' => 'test'], ['count' => 3, 'items' => ['a', 'b', 'c']]),
+        ]);
 
-        $serialized = MessageSerializer::serialize([$message]);
+        $this->assertSame([[
+            'type' => 'tool_result',
+            'tool_results' => [[
+                'tool_call_id' => 'call-1',
+                'tool_name' => 'search',
+                'args' => ['query' => 'test'],
+                'result' => ['count' => 3, 'items' => ['a', 'b', 'c']],
+            ]],
+        ]], MessageSerializer::serialize([$message]));
 
-        $this->assertSame('tool_result', $serialized[0]['type']);
-        $this->assertCount(1, $serialized[0]['tool_results']);
-        $this->assertSame('call-1', $serialized[0]['tool_results'][0]['tool_call_id']);
-        $this->assertSame('search', $serialized[0]['tool_results'][0]['tool_name']);
-        $this->assertSame(['query' => 'test'], $serialized[0]['tool_results'][0]['args']);
-        $this->assertSame(['count' => 3, 'items' => ['a', 'b', 'c']], $serialized[0]['tool_results'][0]['result']);
-
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(1, $deserialized);
-        $this->assertInstanceOf(ToolResultMessage::class, $deserialized[0]);
-        $this->assertCount(1, $deserialized[0]->toolResults);
-        $this->assertSame('call-1', $deserialized[0]->toolResults[0]->toolCallId);
-        $this->assertSame('search', $deserialized[0]->toolResults[0]->toolName);
-        $this->assertSame(['query' => 'test'], $deserialized[0]->toolResults[0]->args);
-        $this->assertSame(['count' => 3, 'items' => ['a', 'b', 'c']], $deserialized[0]->toolResults[0]->result);
+        $this->assertRoundTrip($message);
     }
 
     public function test_roundtrip_system_message(): void
     {
         $message = new SystemMessage('You are a helpful assistant.');
 
-        $serialized = MessageSerializer::serialize([$message]);
-
-        $this->assertSame('system', $serialized[0]['type']);
-        $this->assertSame('You are a helpful assistant.', $serialized[0]['content']);
-
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(1, $deserialized);
-        $this->assertInstanceOf(SystemMessage::class, $deserialized[0]);
-        $this->assertSame('You are a helpful assistant.', $deserialized[0]->content);
+        $this->assertSame([['type' => 'system', 'content' => 'You are a helpful assistant.']], MessageSerializer::serialize([$message]));
+        $this->assertRoundTrip($message);
     }
 
     public function test_unknown_message_type_throws(): void
     {
-        $data = [
-            ['type' => 'bogus', 'content' => 'Hello'],
-        ];
-
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Unknown message type: bogus');
 
-        MessageSerializer::deserialize($data);
+        MessageSerializer::deserialize([['type' => 'bogus', 'content' => 'Hello']]);
     }
 
     public function test_roundtrip_mixed_conversation(): void
     {
-        $messages = [
+        $this->assertRoundTrip(
             new SystemMessage('You are helpful.'),
             new UserMessage('Search for cats'),
-            new AssistantMessage('I will search', [new ToolCall(id: 'tc-1', name: 'search', arguments: ['q' => 'cats'])]),
-            new ToolResultMessage([new ToolResult(toolCallId: 'tc-1', toolName: 'search', args: ['q' => 'cats'], result: 'Found 5 cats')]),
+            new AssistantMessage('I will search', [new ToolCall('tc-1', 'search', ['q' => 'cats'])]),
+            new ToolResultMessage([new ToolResult('tc-1', 'search', ['q' => 'cats'], 'Found 5 cats')]),
             new AssistantMessage('I found 5 cats!'),
-        ];
+        );
+    }
 
-        $serialized = MessageSerializer::serialize($messages);
-        $deserialized = MessageSerializer::deserialize($serialized);
-
-        $this->assertCount(5, $deserialized);
-        $this->assertInstanceOf(SystemMessage::class, $deserialized[0]);
-        $this->assertInstanceOf(UserMessage::class, $deserialized[1]);
-        $this->assertInstanceOf(AssistantMessage::class, $deserialized[2]);
-        $this->assertInstanceOf(ToolResultMessage::class, $deserialized[3]);
-        $this->assertInstanceOf(AssistantMessage::class, $deserialized[4]);
-
-        $this->assertCount(1, $deserialized[2]->toolCalls);
-        $this->assertSame('tc-1', $deserialized[2]->toolCalls[0]->id);
-        $this->assertCount(1, $deserialized[3]->toolResults);
-        $this->assertSame('Found 5 cats', $deserialized[3]->toolResults[0]->result);
+    private function assertRoundTrip(Message ...$messages): void
+    {
+        $this->assertEquals(array_values($messages), MessageSerializer::deserialize(MessageSerializer::serialize($messages)));
     }
 }

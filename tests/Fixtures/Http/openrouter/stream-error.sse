@@ -1,0 +1,6 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1758200200-Vb8Tn2Kq5Wm1Rz7Lp4Xs","provider":"OpenAI","model":"openai/gpt-5","object":"chat.completion.chunk","created":1758200200,"choices":[{"index":0,"delta":{"role":"assistant","content":"The forecast"},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1758200200-Vb8Tn2Kq5Wm1Rz7Lp4Xs","provider":"OpenAI","model":"openai/gpt-5","object":"chat.completion.chunk","created":1758200200,"error":{"code":"server_error","message":"Provider disconnected unexpectedly"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}
+
